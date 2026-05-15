@@ -1,0 +1,47 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    match /channels/{channelId} {
+      allow read: if signedIn();
+      allow create: if signedIn()
+        && request.resource.data.createdBy == request.auth.uid
+        && request.resource.data.keys().hasAll(['name', 'createdBy', 'createdAt']);
+      allow update: if signedIn() && resource.data.createdBy == request.auth.uid;
+
+      match /members/{memberId} {
+        allow read: if signedIn();
+        allow create, update, delete: if signedIn() && request.auth.uid == memberId;
+      }
+
+      match /messages/{messageId} {
+        allow read: if signedIn();
+        allow create: if signedIn()
+          && request.resource.data.senderId == request.auth.uid
+          && request.resource.data.keys().hasAll([
+               'senderId', 'senderName', 'mimeType', 'audioBase64', 'size', 'createdAt'
+             ])
+          && request.resource.data.audioBase64 is string
+          && request.resource.data.audioBase64.size() <= 1048576
+          && request.resource.data.size is int
+          && request.resource.data.size > 0
+          && request.resource.data.size <= 786432;
+        allow update, delete: if false;
+      }
+
+      match /chat/{messageId} {
+        allow read: if signedIn();
+        allow create: if signedIn()
+          && request.resource.data.senderId == request.auth.uid
+          && request.resource.data.keys().hasAll(['senderId', 'senderName', 'text', 'createdAt'])
+          && request.resource.data.text is string
+          && request.resource.data.text.size() > 0
+          && request.resource.data.text.size() <= 2000;
+        allow update, delete: if false;
+      }
+    }
+  }
+}

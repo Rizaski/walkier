@@ -48,6 +48,9 @@ const memberCount = document.getElementById("member-count");
 const pttBtn = document.getElementById("ptt-btn");
 const incomingIndicator = document.getElementById("incoming-indicator");
 const incomingName = document.getElementById("incoming-name");
+const notifyBanner = document.getElementById("notify-banner");
+const notifyBannerText = document.getElementById("notify-banner-text");
+const notifyEnableBtn = document.getElementById("notify-enable-btn");
 const micHint = document.getElementById("mic-hint");
 const userDisplay = document.getElementById("user-display");
 const lastActivity = document.getElementById("last-activity");
@@ -682,6 +685,25 @@ function isMobileDevice() {
   );
 }
 
+function isIOS() {
+  return /iPhone|iPad|iPod/i.test(navigator.userAgent);
+}
+
+function isStandalonePwa() {
+  return (
+    window.matchMedia("(display-mode: standalone)").matches ||
+    window.navigator.standalone === true
+  );
+}
+
+function isReceivingAudio() {
+  if (isPlaying) return true;
+  for (const session of streamSessions.values()) {
+    if (session.playing || session.mseStarted) return true;
+  }
+  return playbackQueue.length > 0;
+}
+
 function defaultDisplayName(user) {
   if (user.displayName) return user.displayName.trim().slice(0, 24);
   if (user.email) return user.email.split("@")[0].slice(0, 24);
@@ -785,6 +807,7 @@ function mseCodecForMime(mimeType) {
 }
 
 function canStreamPlaybackMse(mimeType) {
+  if (isIOS()) return false;
   if (!window.MediaSource) return false;
   try {
     return MediaSource.isTypeSupported(mseCodecForMime(mimeType));
@@ -830,8 +853,11 @@ function ensureStreamSession(messageId, msg) {
       ended: msg.streaming === false,
       playing: false,
       mseStarted: false,
+      mseFailed: false,
+      mseAppendedSeqs: new Set(),
       pendingMse: [],
       mseAppending: false,
+      eosCalled: false,
     };
     streamSessions.set(messageId, session);
   } else {
@@ -856,13 +882,44 @@ function subscribeStreamChunks(messageId) {
   streamChunkUnsubs.set(messageId, unsub);
 }
 
+function queueMseChunk(session, seq, bytes) {
+  if (session.mseAppendedSeqs.has(seq)) return;
+  session.mseAppendedSeqs.add(seq);
+  session.pendingMse.push(bytes);
+  flushMsePending(session);
+}
+
+function maybeFinalizeMseStream(session) {
+  if (!session.ended || session.eosCalled || session.mseFailed) return;
+  const count = session.msg.chunkCount || 0;
+  if (count < 1) return;
+  for (let i = 0; i < count; i++) {
+    if (!session.chunks.has(i) || !session.mseAppendedSeqs.has(i)) return;
+  }
+  if (
+    session.pendingMse.length > 0 ||
+    session.mseAppending ||
+    session.sourceBuffer?.updating
+  ) {
+    return;
+  }
+  session.eosCalled = true;
+  try {
+    if (session.mediaSource?.readyState === "open") {
+      session.mediaSource.endOfStream();
+    }
+  } catch (_) {}
+}
+
 function flushMsePending(session) {
   if (
     !session.sourceBuffer ||
     session.mseAppending ||
+    session.mseFailed ||
     session.pendingMse.length === 0 ||
     session.sourceBuffer.updating
   ) {
+    maybeFinalizeMseStream(session);
     return;
   }
   session.mseAppending = true;
@@ -880,15 +937,7 @@ function flushMsePending(session) {
     () => {
       session.mseAppending = false;
       flushMsePending(session);
-      if (
-        session.ended &&
-        session.pendingMse.length === 0 &&
-        !session.sourceBuffer.updating
-      ) {
-        try {
-          session.mediaSource.endOfStream();
-        } catch (_) {}
-      }
+      maybeFinalizeMseStream(session);
     },
     { once: true }
   );
@@ -943,9 +992,8 @@ async function startMseStreamPlayback(session, messageId) {
 
   const ordered = [...session.chunks.keys()].sort((a, b) => a - b);
   for (const seq of ordered) {
-    session.pendingMse.push(session.chunks.get(seq));
+    queueMseChunk(session, seq, session.chunks.get(seq));
   }
-  flushMsePending(session);
   isPlaying = true;
   const onMsePlaybackEnd = () => {
     playback.removeEventListener("ended", onMsePlaybackEnd);
@@ -977,18 +1025,37 @@ function onStreamChunk(messageId, chunk) {
     if (ready) {
       startMseStreamPlayback(session, messageId).catch(() => {
         session.mseFailed = true;
+        playedMessageIds.delete(messageId);
+        teardownMsePlayback(session);
         tryCompleteStreamPlayback(messageId);
       });
       return;
     }
   }
 
-  if (session.mseStarted && session.sourceBuffer) {
-    session.pendingMse.push(session.chunks.get(chunk.seq));
-    flushMsePending(session);
+  if (session.mseStarted && session.sourceBuffer && !session.mseFailed) {
+    queueMseChunk(session, chunk.seq, session.chunks.get(chunk.seq));
   }
 
   tryCompleteStreamPlayback(messageId);
+}
+
+function teardownMsePlayback(session) {
+  if (!session) return;
+  try {
+    playback.pause();
+    playback.loop = false;
+    playback.removeAttribute("src");
+    playback.load();
+  } catch (_) {}
+  if (session.mseUrl) revokePlaybackObjectUrl(session.mseUrl);
+  session.mseUrl = null;
+  session.mediaSource = null;
+  session.sourceBuffer = null;
+  session.mseStarted = false;
+  session.playing = false;
+  session.pendingMse = [];
+  session.mseAppending = false;
 }
 
 function tryCompleteStreamPlayback(messageId) {
@@ -1002,12 +1069,17 @@ function tryCompleteStreamPlayback(messageId) {
   }
 
   if (session.mseStarted && !session.mseFailed) {
-    session.pendingMse = [];
     for (let i = 0; i < count; i++) {
-      session.pendingMse.push(session.chunks.get(i));
+      if (!session.chunks.has(i)) return;
+      queueMseChunk(session, i, session.chunks.get(i));
     }
-    flushMsePending(session);
+    maybeFinalizeMseStream(session);
     return;
+  }
+
+  if (session.mseFailed) {
+    playedMessageIds.delete(messageId);
+    teardownMsePlayback(session);
   }
 
   if (playedMessageIds.has(messageId)) return;
@@ -1026,7 +1098,7 @@ function handleStreamingMessage(messageId, msg) {
   if (playedMessageIds.has(messageId)) return;
   ensureStreamSession(messageId, msg);
   subscribeStreamChunks(messageId);
-  if (msg.streaming === true && !isPlaying) {
+  if (msg.streaming === true && !isReceivingAudio()) {
     incomingIndicator.classList.remove("hidden");
     incomingName.textContent = msg.senderName || "Someone";
     setPttState("rx");
@@ -1105,7 +1177,7 @@ async function stopRecordingAndSend() {
   setPttState("idle");
   stopAudioViz();
   playPttEndSound();
-  if (channelDocRef && !isPlaying) {
+  if (channelDocRef && !isReceivingAudio()) {
     startChannelSilenceLoop().catch(() => {});
   }
 
@@ -1199,18 +1271,79 @@ async function registerServiceWorker() {
 }
 
 async function ensureNotificationPermission() {
-  if (!("Notification" in window)) return false;
+  if (!("Notification" in window)) {
+    showToast("Notifications are not supported in this browser", "info");
+    return false;
+  }
   if (Notification.permission === "granted") {
     notificationsReady = true;
+    updateNotifyBanner();
     return true;
   }
-  if (Notification.permission === "denied") return false;
+  if (Notification.permission === "denied") {
+    updateNotifyBanner();
+    return false;
+  }
   try {
+    await registerServiceWorker();
     const permission = await Notification.requestPermission();
     notificationsReady = permission === "granted";
+    updateNotifyBanner();
     return notificationsReady;
   } catch {
+    updateNotifyBanner();
     return false;
+  }
+}
+
+function updateNotifyBanner() {
+  if (!notifyBanner) return;
+  const onChannel = Boolean(channelDocRef);
+  const supported = "Notification" in window;
+  const permission = supported ? Notification.permission : "denied";
+
+  if (!onChannel || !supported || permission === "granted") {
+    notifyBanner.classList.add("hidden");
+    return;
+  }
+
+  if (notifyBannerText) {
+    if (permission === "denied") {
+      notifyBannerText.textContent = isIOS()
+        ? "Notifications blocked. Open Settings → WalkieR → Notifications to allow alerts."
+        : "Notifications are blocked in browser settings.";
+    } else if (isIOS() && !isStandalonePwa()) {
+      notifyBannerText.textContent =
+        "On iPhone: Share → Add to Home Screen, open WalkieR from the icon, then tap Enable alerts.";
+    } else {
+      notifyBannerText.textContent = "Tap Enable alerts to hear when someone talks while the app is in the background.";
+    }
+  }
+
+  if (notifyEnableBtn) {
+    notifyEnableBtn.classList.toggle("hidden", permission === "denied");
+  }
+
+  notifyBanner.classList.remove("hidden");
+}
+
+function requestNotificationsFromUserGesture() {
+  if (!("Notification" in window) || Notification.permission !== "default") return;
+  Notification.requestPermission().then((permission) => {
+    notificationsReady = permission === "granted";
+    updateNotifyBanner();
+    if (permission === "granted") {
+      showToast("Notifications enabled", "success");
+    }
+  });
+}
+
+async function enableNotificationsFromButton() {
+  const granted = await ensureNotificationPermission();
+  if (granted) {
+    showToast("Notifications enabled for voice alerts", "success");
+  } else if (Notification.permission === "denied") {
+    showToast("Enable notifications in system Settings", "info");
   }
 }
 
@@ -1289,7 +1422,7 @@ function setupMediaSessionHandlers() {
   try {
     navigator.mediaSession.setActionHandler("play", async () => {
       await resumeAudioSession();
-      if (channelDocRef && !isPlaying) {
+      if (channelDocRef && !isReceivingAudio()) {
         await startChannelSilenceLoop();
       } else if (playback.src && playback.paused) {
         await playback.play();
@@ -1380,7 +1513,7 @@ async function resumeAudioSession() {
 }
 
 async function startChannelSilenceLoop() {
-  if (!playback || channelSilenceLoopActive || isPlaying) return;
+  if (!playback || channelSilenceLoopActive || isReceivingAudio()) return;
   try {
     playback.loop = true;
     playback.src = SILENT_WAV;
@@ -1465,6 +1598,7 @@ async function unlockPlaybackElement() {
 }
 
 async function playMessageAudio(src, message) {
+  stopChannelSilenceLoop(true);
   channelSilenceLoopActive = false;
   playback.loop = false;
   playback.pause();
@@ -1483,14 +1617,25 @@ async function playMessageAudio(src, message) {
   updateMediaPositionFromPlayback();
 
   await new Promise((resolve) => {
+    let settled = false;
     const finish = () => {
+      if (settled) return;
+      settled = true;
       playback.removeEventListener("timeupdate", onTimeUpdate);
       playback.onended = null;
       playback.onerror = null;
       resolve();
     };
     playback.onended = finish;
-    playback.onerror = finish;
+    playback.onerror = () => {
+      const d = playback.duration;
+      if (!d || !Number.isFinite(d) || playback.currentTime >= d - 0.2) {
+        finish();
+      } else {
+        console.warn("Playback interrupted:", playback.error);
+      }
+    };
+    setTimeout(finish, 90000);
   });
 }
 
@@ -1502,16 +1647,13 @@ function prepareMobileChannelAudioSafe() {
 }
 
 function promptNotificationsAfterJoin() {
-  if (!("Notification" in window) || Notification.permission !== "default") return;
-  ensureNotificationPermission().then((granted) => {
-    if (granted) showToast("Notifications on for background voice alerts", "success");
-  });
+  updateNotifyBanner();
 }
 
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible" && channelDocRef) {
     resumeAudioSession();
-    if (!isPlaying && !channelSilenceLoopActive) {
+    if (!isReceivingAudio() && !channelSilenceLoopActive) {
       startChannelSilenceLoop();
     }
     if (playbackQueue.length > 0) processPlaybackQueue();
@@ -1644,6 +1786,7 @@ async function joinChannel(name, channel) {
     showToast(`Joined #${channelId}`, "success");
     prepareMobileChannelAudioSafe();
     promptNotificationsAfterJoin();
+    updateNotifyBanner();
   } catch (err) {
     console.error("Join channel error:", err);
     showError(joinError, firebaseErrorMessage(err));
@@ -1732,7 +1875,7 @@ function setupListeners() {
     const anyoneElseTalking = entries.some(
       ([id, m]) => id !== uid && m.talking === true
     );
-    if (!anyoneElseTalking && !isPlaying) {
+    if (!anyoneElseTalking && !isReceivingAudio()) {
       incomingIndicator.classList.add("hidden");
     }
   });
@@ -1824,6 +1967,7 @@ async function leaveChannel() {
   pttBtn.disabled = true;
   playedMessageIds.clear();
   cleanupAllStreamSessions();
+  updateNotifyBanner();
   activeTxMessageRef = null;
   txChunkUploadQueue = [];
   playbackQueue = [];
@@ -1874,8 +2018,15 @@ updateChannelPreview();
 
 joinForm.addEventListener("submit", (e) => {
   e.preventDefault();
+  requestNotificationsFromUserGesture();
   joinChannel(displayNameInput.value, channelIdInput.value);
 });
+
+if (notifyEnableBtn) {
+  notifyEnableBtn.addEventListener("click", () => {
+    enableNotificationsFromButton();
+  });
+}
 
 leaveBtn.addEventListener("click", () => {
   leaveChannel();

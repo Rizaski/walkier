@@ -492,12 +492,30 @@ function blobToBase64(blob) {
   });
 }
 
+const playbackObjectUrls = new Set();
+
+function revokePlaybackObjectUrl(url) {
+  if (!url || !playbackObjectUrls.has(url)) return;
+  URL.revokeObjectURL(url);
+  playbackObjectUrls.delete(url);
+}
+
 function getMessageAudioSrc(msg) {
   if (msg.audioUrl) return msg.audioUrl;
-  if (msg.audioBase64) {
-    return `data:${msg.mimeType || "audio/webm"};base64,${msg.audioBase64}`;
+  if (!msg.audioBase64) return null;
+  const mime = msg.mimeType || "audio/webm";
+  try {
+    const binary = atob(msg.audioBase64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    const blob = new Blob([bytes], { type: mime });
+    const url = URL.createObjectURL(blob);
+    playbackObjectUrls.add(url);
+    return url;
+  } catch (err) {
+    console.warn("Blob URL playback fallback:", err);
+    return `data:${mime};base64,${msg.audioBase64}`;
   }
-  return null;
 }
 
 function messageCreatedMs(msg) {
@@ -525,12 +543,10 @@ function updateChannelPreview() {
 }
 
 function getMimeType() {
-  const types = [
-    "audio/webm;codecs=opus",
-    "audio/webm",
-    "audio/mp4",
-    "audio/ogg;codecs=opus",
-  ];
+  const ios = /iPhone|iPad|iPod/i.test(navigator.userAgent);
+  const types = ios
+    ? ["audio/mp4", "audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus"]
+    : ["audio/webm;codecs=opus", "audio/webm", "audio/mp4", "audio/ogg;codecs=opus"];
   for (const t of types) {
     if (MediaRecorder.isTypeSupported(t)) return t;
   }
@@ -924,16 +940,81 @@ async function prepareMobileChannelAudio() {
   if (Notification.permission === "granted") {
     notificationsReady = true;
   }
-  await startKeepAliveAudio();
+  if (isMobileDevice()) {
+    await startKeepAliveAudio();
+  }
   await resumeAudioSession();
   if ("mediaSession" in navigator) {
     try {
       navigator.mediaSession.setActionHandler("play", () => resumeAudioSession());
-      navigator.mediaSession.setActionHandler("pause", () => {});
     } catch (err) {
       console.warn("Media session handlers failed:", err);
     }
   }
+}
+
+function pauseKeepAliveForPlayback() {
+  if (keepAliveAudio && !keepAliveAudio.paused) {
+    keepAliveAudio.pause();
+  }
+}
+
+function resumeKeepAliveAfterPlayback() {
+  if (!channelDocRef || !keepAliveAudio) return;
+  keepAliveAudio.play().catch(() => {});
+}
+
+function waitForPlaybackReady(el) {
+  return new Promise((resolve) => {
+    if (el.readyState >= 2) {
+      resolve();
+      return;
+    }
+    const done = () => {
+      el.removeEventListener("canplay", done);
+      el.removeEventListener("loadeddata", done);
+      el.removeEventListener("error", done);
+      resolve();
+    };
+    el.addEventListener("canplay", done, { once: true });
+    el.addEventListener("loadeddata", done, { once: true });
+    el.addEventListener("error", done, { once: true });
+    setTimeout(done, 4000);
+  });
+}
+
+async function unlockPlaybackElement() {
+  if (!playback) return;
+  try {
+    playback.src = SILENT_WAV;
+    playback.volume = 0.01;
+    playback.setAttribute("playsinline", "");
+    await playback.play();
+    playback.pause();
+    playback.removeAttribute("src");
+    playback.load();
+    playback.volume = 1;
+  } catch (err) {
+    console.warn("Playback unlock failed:", err);
+  }
+}
+
+async function playMessageAudio(src) {
+  pauseKeepAliveForPlayback();
+  playback.src = src;
+  playback.load();
+  playback.volume = 1;
+  await waitForPlaybackReady(playback);
+  await playback.play();
+  await new Promise((resolve) => {
+    const finish = () => {
+      playback.onended = null;
+      playback.onerror = null;
+      resolve();
+    };
+    playback.onended = finish;
+    playback.onerror = finish;
+  });
 }
 
 /** Non-blocking; must not fail channel join. */
@@ -974,33 +1055,32 @@ async function processPlaybackQueue() {
   setPttState("rx");
   setActivity(`Listening to ${msg.senderName}`);
   updateMediaSessionForRx(msg);
-  await resumeAudioSession();
 
+  let src = null;
   try {
-    const src = getMessageAudioSrc(msg);
-    if (!src) return;
-    playback.src = src;
-    playback.load();
-    playback.volume = 1;
-    await playback.play();
-    await new Promise((resolve) => {
-      playback.onended = resolve;
-      playback.onerror = resolve;
-    });
+    await resumeAudioSession();
+    src = getMessageAudioSrc(msg);
+    if (!src) {
+      console.warn("Message has no playable audio");
+    } else {
+      await playMessageAudio(src);
+    }
   } catch (e) {
     console.warn("Playback failed:", e);
-  }
+  } finally {
+    revokePlaybackObjectUrl(src);
+    incomingIndicator.classList.add("hidden");
+    isPlaying = false;
+    resumeKeepAliveAfterPlayback();
 
-  incomingIndicator.classList.add("hidden");
-  isPlaying = false;
-
-  if (playbackQueue.length > 0) {
-    processPlaybackQueue();
-  } else {
-    clearMediaSession();
-    if (!isTransmitting) {
-      setPttState("idle");
-      setActivity("Ready");
+    if (playbackQueue.length > 0) {
+      processPlaybackQueue();
+    } else {
+      clearMediaSession();
+      if (!isTransmitting) {
+        setPttState("idle");
+        setActivity("Ready");
+      }
     }
   }
 }
@@ -1069,6 +1149,7 @@ async function joinChannel(name, channel) {
     joinTimestamp = Date.now();
     setupListeners();
     await initMicrophone();
+    await unlockPlaybackElement();
 
     saveRecentChannel(channelId);
     activeChannelEl.textContent = channelId;
@@ -1252,6 +1333,8 @@ async function leaveChannel() {
   playedMessageIds.clear();
   playbackQueue = [];
   incomingIndicator.classList.add("hidden");
+  playbackObjectUrls.forEach((url) => URL.revokeObjectURL(url));
+  playbackObjectUrls.clear();
   stopKeepAliveAudio();
   clearMediaSession();
 

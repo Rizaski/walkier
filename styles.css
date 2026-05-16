@@ -174,59 +174,6 @@ body {
   cursor: pointer;
 }
 
-body.gsi-open { overflow: hidden; }
-
-.gsi-overlay {
-  position: fixed;
-  inset: 0;
-  z-index: 2000;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 1rem;
-  padding-top: calc(1rem + var(--safe-top));
-  background: rgba(3, 6, 10, 0.72);
-  backdrop-filter: blur(6px);
-}
-
-.gsi-panel {
-  width: min(100%, 340px);
-  padding: 1.25rem 1.1rem 1rem;
-  border-radius: var(--radius-md);
-  background: var(--surface-elevated, #121820);
-  border: 1px solid var(--glass-border);
-  box-shadow: 0 24px 48px rgba(0, 0, 0, 0.45);
-  text-align: center;
-}
-
-.gsi-title {
-  margin: 0 0 1rem;
-  font-family: var(--font-display, inherit);
-  font-size: 1.05rem;
-  font-weight: 600;
-  color: var(--text-primary, #f3f4f6);
-}
-
-#gsi-button-host {
-  display: flex;
-  justify-content: center;
-  min-height: 44px;
-  margin-bottom: 0.75rem;
-}
-
-.gsi-cancel {
-  width: 100%;
-  padding: 0.65rem 1rem;
-  border: 1px solid var(--glass-border);
-  border-radius: var(--radius-sm);
-  background: transparent;
-  color: var(--text-muted, #9ca3af);
-  font-size: 0.9rem;
-  cursor: pointer;
-}
-
-.gsi-cancel:active { opacity: 0.85; }
-
 /* Toasts */
 .toast-root {
   position: fixed;
@@ -662,19 +609,6 @@ body.gsi-open { overflow: hidden; }
   color: #042f1a;
   box-shadow: 0 8px 32px var(--accent-glow);
 }
-
-.btn-google {
-  background: #fff;
-  color: #1e293b;
-  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.25);
-}
-
-.btn-google .btn-spinner {
-  border-color: rgba(0, 0, 0, 0.12);
-  border-top-color: #1e293b;
-}
-
-.google-icon { width: 20px; height: 20px; }
 
 .btn-ghost {
   background: transparent;

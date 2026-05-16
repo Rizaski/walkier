@@ -37,14 +37,6 @@ const displayNameInput = document.getElementById("display-name");
 const channelIdInput = document.getElementById("channel-id");
 const joinBtn = document.getElementById("join-btn");
 const joinError = document.getElementById("join-error");
-const googleSignInBtn = document.getElementById("google-sign-in-btn");
-const signOutBtn = document.getElementById("sign-out-btn");
-const signedOutView = document.getElementById("signed-out-view");
-const signedInView = document.getElementById("signed-in-view");
-const userAvatar = document.getElementById("user-avatar");
-const userNameEl = document.getElementById("user-name");
-const userEmailEl = document.getElementById("user-email");
-const signInHint = document.getElementById("sign-in-hint");
 const leaveBtn = document.getElementById("leave-btn");
 const activeChannelEl = document.getElementById("active-channel");
 const connectionStatus = document.getElementById("connection-status");
@@ -114,129 +106,6 @@ const STORAGE_KEY_RECENT = "walkier_recent_channels";
 let audioAnalyser = null;
 let audioAnalyserRaf = null;
 
-const googleProvider = new firebase.auth.GoogleAuthProvider();
-googleProvider.setCustomParameters({ prompt: "select_account" });
-
-let cachedGoogleWebClientId = null;
-
-async function fetchGoogleWebClientId() {
-  if (cachedGoogleWebClientId) return cachedGoogleWebClientId;
-  const res = await fetch(
-    `https://identitytoolkit.googleapis.com/v1/accounts:createAuthUri?key=${firebaseConfig.apiKey}`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        continueUri: `${location.origin}/`,
-        providerId: "google.com",
-      }),
-    }
-  );
-  const data = await res.json();
-  if (!res.ok) {
-    throw new Error(data.error?.message || "Could not load Google Sign-In configuration.");
-  }
-  const match = data.authUri && data.authUri.match(/client_id=([^&]+)/);
-  cachedGoogleWebClientId = match ? decodeURIComponent(match[1]) : null;
-  return cachedGoogleWebClientId;
-}
-
-function ensureGsiLoaded() {
-  if (window.google?.accounts?.id) return Promise.resolve();
-  return new Promise((resolve, reject) => {
-    const existing = document.querySelector("script[data-walkier-gsi]");
-    if (existing) {
-      existing.addEventListener("load", () => resolve(), { once: true });
-      existing.addEventListener("error", () => reject(new Error("Could not load Google Sign-In.")), {
-        once: true,
-      });
-      return;
-    }
-    const script = document.createElement("script");
-    script.src = "https://accounts.google.com/gsi/client";
-    script.async = true;
-    script.defer = true;
-    script.dataset.walkierGsi = "1";
-    script.onload = () => resolve();
-    script.onerror = () => reject(new Error("Could not load Google Sign-In."));
-    document.head.appendChild(script);
-  });
-}
-
-/** Google Identity Services → Firebase credential (no redirect_uri; reliable on iOS/Android). */
-function signInWithGoogleCredentialUi() {
-  return new Promise(async (resolve, reject) => {
-    let settled = false;
-    const finish = (fn, value) => {
-      if (settled) return;
-      settled = true;
-      fn(value);
-    };
-
-    try {
-      const clientId = await fetchGoogleWebClientId();
-      if (!clientId) throw new Error("Google Sign-In is not enabled in Firebase.");
-      await ensureGsiLoaded();
-
-      const overlay = document.createElement("div");
-      overlay.className = "gsi-overlay";
-      overlay.setAttribute("role", "dialog");
-      overlay.setAttribute("aria-modal", "true");
-      overlay.innerHTML =
-        '<div class="gsi-panel">' +
-        '<p class="gsi-title">Sign in with Google</p>' +
-        '<div id="gsi-button-host"></div>' +
-        '<button type="button" class="gsi-cancel">Cancel</button>' +
-        "</div>";
-
-      const host = overlay.querySelector("#gsi-button-host");
-      const cancelBtn = overlay.querySelector(".gsi-cancel");
-
-      const cleanup = () => {
-        overlay.remove();
-        document.body.classList.remove("gsi-open");
-      };
-
-      cancelBtn.addEventListener("click", () => {
-        cleanup();
-        finish(reject, Object.assign(new Error("Sign-in cancelled."), { code: "auth/cancelled-popup-request" }));
-      });
-
-      overlay.addEventListener("click", (e) => {
-        if (e.target === overlay) cancelBtn.click();
-      });
-
-      google.accounts.id.initialize({
-        client_id: clientId,
-        callback: async (response) => {
-          cleanup();
-          try {
-            const credential = firebase.auth.GoogleAuthProvider.credential(response.credential);
-            finish(resolve, await auth.signInWithCredential(credential));
-          } catch (err) {
-            finish(reject, err);
-          }
-        },
-        auto_select: false,
-        cancel_on_tap_outside: false,
-        itp_support: true,
-      });
-
-      google.accounts.id.renderButton(host, {
-        type: "standard",
-        theme: "outline",
-        size: "large",
-        text: "signin_with",
-        width: 300,
-      });
-
-      document.body.classList.add("gsi-open");
-      document.body.appendChild(overlay);
-    } catch (err) {
-      finish(reject, err);
-    }
-  });
-}
 
 // Restore saved values
 const savedName = localStorage.getItem(STORAGE_KEY_NAME);
@@ -531,9 +400,7 @@ function checkMobileAccess() {
 
   const lines = [];
   if (lanIp) {
-    lines.push(
-      "PC IP URLs (http://192.168.x.x) cannot use Google sign-in on iPhone. Use your deployed HTTPS URL instead."
-    );
+    lines.push("PC IP URLs (http://192.168.x.x) may not work on phones. Use your deployed HTTPS URL instead.");
   }
   if (needsHttps) {
     lines.push("Microphone needs HTTPS — use your deployed URL or a tunnel on your phone.");
@@ -543,7 +410,7 @@ function checkMobileAccess() {
       "Firebase → Authentication → Authorized domains must include this host (tap to copy):"
     );
     lines.push(`<code class="domain-copy">${location.hostname}</code>`);
-    lines.push("Complete the localtunnel password page before signing in with Google.");
+    lines.push("Complete the localtunnel password page before using the app.");
   }
 
   if (lines.length === 0) return;
@@ -636,7 +503,7 @@ function messageCreatedMs(msg) {
 }
 
 function setJoinLoading(loading) {
-  joinBtn.disabled = loading || !(auth.currentUser && !auth.currentUser.isAnonymous);
+  joinBtn.disabled = loading || !auth.currentUser;
   joinBtn.querySelector(".btn-label").classList.toggle("hidden", loading);
   joinBtn.querySelector(".btn-spinner").classList.toggle("hidden", !loading);
 }
@@ -766,130 +633,16 @@ function defaultDisplayName(user) {
   return "User";
 }
 
-function updateAuthUI(user) {
-  const signedIn = !!(user && !user.isAnonymous);
-  signedOutView.classList.toggle("hidden", signedIn);
-  signedInView.classList.toggle("hidden", !signedIn);
-  joinBtn.disabled = !signedIn;
-  signInHint.classList.toggle("hidden", signedIn);
-
-  if (signedIn) {
-    const name = defaultDisplayName(user);
-    userNameEl.textContent = name;
-    userEmailEl.textContent = user.email || "";
-    if (user.photoURL) {
-      userAvatar.src = user.photoURL;
-      userAvatar.alt = name;
-      userAvatar.hidden = false;
-    } else {
-      userAvatar.removeAttribute("src");
-      userAvatar.alt = "";
-      userAvatar.hidden = true;
-    }
-    if (!displayNameInput.value.trim()) {
-      displayNameInput.value = name;
-    }
-  }
+function setJoinReady(ready) {
+  joinBtn.disabled = !ready;
 }
 
-function setGoogleBtnLoading(loading) {
-  googleSignInBtn.disabled = loading;
-  googleSignInBtn.querySelector(".btn-label").classList.toggle("hidden", loading);
-  googleSignInBtn.querySelector(".btn-spinner").classList.toggle("hidden", !loading);
-}
-
-function googleAuthErrorMessage(err) {
+function authErrorMessage(err) {
   const code = err && err.code;
-  const host = location.hostname;
-  if (code === "auth/unauthorized-domain") {
-    return `Unauthorized domain for Vercel. Firebase Console → Authentication → Settings → Authorized domains → add: ${host}`;
+  if (code === "auth/operation-not-allowed") {
+    return "Anonymous sign-in is disabled. Enable Anonymous in Firebase → Authentication → Sign-in method.";
   }
-  if (code === "auth/operation-not-supported-in-this-environment") {
-    return "Sign-in not supported here. Open in Safari (not in-app browser), disable Private Browsing, and allow cookies.";
-  }
-  if (code === "auth/popup-blocked") {
-    return "Popup blocked. Allow popups for this site, then try again.";
-  }
-  if (code === "auth/web-storage-unsupported") {
-    return "Cookies/storage blocked. Disable private mode or allow site data.";
-  }
-  if (code === "auth/missing-initial-state") {
-    return "Sign-in session was lost. Use Safari or Chrome (not in-app browser) and disable Private Browsing.";
-  }
-  return (err && err.message) || "Google sign-in failed.";
-}
-
-function isAuthHostSupported() {
-  const host = location.hostname;
-  const localhostish =
-    host === "localhost" || host === "127.0.0.1" || /^127\.\d+\.\d+\.\d+$/.test(host);
-  return window.isSecureContext && !localhostish && !isTunnelHost();
-}
-
-function applyGoogleSignInResult(result) {
-  uid = result.user.uid;
-  updateAuthUI(result.user);
-  showToast(`Welcome, ${defaultDisplayName(result.user)}`, "success");
-}
-
-async function signInWithGoogle() {
-  hideError(joinError);
-  setGoogleBtnLoading(true);
-
-  try {
-    await auth.setPersistence(firebase.auth.Auth.Persistence.LOCAL);
-
-    if (window.isSecureContext && !isTunnelHost()) {
-      try {
-        applyGoogleSignInResult(await signInWithGoogleCredentialUi());
-        return;
-      } catch (gsiErr) {
-        if (
-          gsiErr.code === "auth/cancelled-popup-request" ||
-          gsiErr.code === "auth/popup-closed-by-user"
-        ) {
-          return;
-        }
-        console.warn("GIS sign-in failed, trying fallback:", gsiErr);
-      }
-    }
-
-    if (isAuthHostSupported()) {
-      try {
-        applyGoogleSignInResult(await auth.signInWithPopup(googleProvider));
-        return;
-      } catch (popupErr) {
-        const popupRecoverable =
-          popupErr.code === "auth/popup-blocked" ||
-          popupErr.code === "auth/cancelled-popup-request" ||
-          popupErr.code === "auth/popup-closed-by-user" ||
-          popupErr.code === "auth/operation-not-supported-in-this-environment";
-        if (!popupRecoverable) throw popupErr;
-      }
-      await auth.signInWithRedirect(googleProvider);
-      return;
-    }
-
-    throw new Error("Google sign-in needs HTTPS. Open your deployed app URL on this device.");
-  } catch (err) {
-    console.error("Google sign-in error:", err);
-    if (
-      err.code !== "auth/popup-closed-by-user" &&
-      err.code !== "auth/cancelled-popup-request"
-    ) {
-      showError(joinError, googleAuthErrorMessage(err));
-    }
-  } finally {
-    setGoogleBtnLoading(false);
-  }
-}
-
-async function signOut() {
-  hideError(joinError);
-  if (memberDocRef) await leaveChannel();
-  await auth.signOut();
-  uid = null;
-  updateAuthUI(null);
+  return (err && err.message) || "Could not connect. Try again.";
 }
 
 // --- Screens ---
@@ -1080,8 +833,8 @@ async function joinChannel(name, channel) {
     }
 
     const user = auth.currentUser;
-    if (!user || user.isAnonymous) {
-      throw new Error("Sign in with Google first.");
+    if (!user) {
+      throw new Error("Connecting… try again in a moment.");
     }
     uid = user.uid;
 
@@ -1385,49 +1138,29 @@ if (chatInput) {
   });
 }
 
-googleSignInBtn.addEventListener("click", signInWithGoogle);
-signOutBtn.addEventListener("click", signOut);
-
 // Prevent accidental page scroll while holding PTT
 document.body.addEventListener("touchmove", (e) => {
   if (isTransmitting) e.preventDefault();
 }, { passive: false });
 
 async function initAuth() {
-  const returningFromRedirect = /[?&](apiKey|mode|oobCode)=/.test(location.search);
-  if (returningFromRedirect) {
-    setGoogleBtnLoading(true);
-    signInHint.textContent = "Completing sign-in…";
-  }
-
   try {
-    const result = await auth.getRedirectResult();
-    if (result && result.user) {
-      uid = result.user.uid;
-      updateAuthUI(result.user);
-      showToast(`Welcome, ${defaultDisplayName(result.user)}`, "success");
-    } else if (result && result.credential && auth.currentUser) {
-      updateAuthUI(auth.currentUser);
+    await auth.setPersistence(firebase.auth.Auth.Persistence.LOCAL);
+    if (!auth.currentUser) {
+      await auth.signInAnonymously();
     }
   } catch (err) {
-    console.error("Redirect sign-in error:", err);
-    showError(joinError, googleAuthErrorMessage(err));
-  } finally {
-    if (returningFromRedirect) {
-      setGoogleBtnLoading(false);
-      if (!auth.currentUser) {
-        signInHint.textContent = "Sign in with Google to continue";
-      }
-    }
+    console.error("Auth error:", err);
+    showError(joinError, authErrorMessage(err));
   }
 
   auth.onAuthStateChanged((user) => {
-    if (user && !user.isAnonymous) {
+    if (user) {
       uid = user.uid;
-      updateAuthUI(user);
+      setJoinReady(true);
     } else {
       uid = null;
-      updateAuthUI(null);
+      setJoinReady(false);
     }
   });
 }

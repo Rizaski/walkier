@@ -1,8 +1,21 @@
 /* WalkieR — Push-to-talk walkie talkie with Firebase */
 
+/** Same-origin auth on Vercel (see vercel.json rewrites). Default firebaseapp.com for localhost. */
+function resolveAuthDomain() {
+  const host = location.hostname;
+  if (
+    host === "localhost" ||
+    host === "127.0.0.1" ||
+    /^\d{1,3}(\.\d{1,3}){3}$/.test(host)
+  ) {
+    return "walkier-1b600.firebaseapp.com";
+  }
+  return host;
+}
+
 const firebaseConfig = {
   apiKey: "AIzaSyDw-fsP8VdwRY1TX_mI-FAcxGPieU0WypA",
-  authDomain: "walkier-1b600.firebaseapp.com",
+  authDomain: resolveAuthDomain(),
   projectId: "walkier-1b600",
   messagingSenderId: "283469627687",
   appId: "1:283469627687:web:113d60070f81525707a902",
@@ -375,40 +388,41 @@ function isVercelHost() {
   return /\.vercel\.app$/i.test(location.hostname);
 }
 
+function isDeployedHost() {
+  if (isVercelHost()) return true;
+  const host = location.hostname;
+  if (host === "localhost" || host === "127.0.0.1" || isLanHost() || isTunnelHost()) {
+    return false;
+  }
+  return window.isSecureContext && location.protocol === "https:";
+}
+
 function checkMobileAccess() {
   const el = document.getElementById("mobile-warning");
-  if (!el) return;
+  if (!el || isDeployedHost()) return;
 
   const onPhone = isMobileDevice();
   const lanIp = isLanHost();
   const tunnel = isTunnelHost();
-  const vercel = isVercelHost();
   const needsHttps = onPhone && !window.isSecureContext;
 
-  if (!onPhone && !lanIp && !tunnel && !vercel && !needsHttps) return;
+  if (!onPhone && !lanIp && !tunnel && !needsHttps) return;
 
   const lines = [];
   if (lanIp) {
     lines.push(
-      "PC IP URLs (http://192.168.x.x) cannot use Google sign-in on iPhone. Use your Vercel HTTPS URL instead."
+      "PC IP URLs (http://192.168.x.x) cannot use Google sign-in on iPhone. Use your deployed HTTPS URL instead."
     );
   }
   if (needsHttps) {
-    lines.push("Microphone needs HTTPS — open your Vercel deployment URL on your phone.");
+    lines.push("Microphone needs HTTPS — use your deployed URL or a tunnel on your phone.");
   }
-  if (vercel || tunnel) {
+  if (tunnel) {
     lines.push(
-      "Google sign-in on iPhone: add this exact host in Firebase → Authentication → Settings → Authorized domains:"
+      "Firebase → Authentication → Authorized domains must include this host (tap to copy):"
     );
     lines.push(`<code class="domain-copy">${location.hostname}</code>`);
-    if (vercel && onPhone) {
-      lines.push(
-        "Use your production URL (e.g. your-app.vercel.app) on iPhone — each preview URL needs its own entry in Firebase."
-      );
-    }
-    if (tunnel) {
-      lines.push("Complete the localtunnel password page before signing in with Google.");
-    }
+    lines.push("Complete the localtunnel password page before signing in with Google.");
   }
 
   if (lines.length === 0) return;
@@ -677,6 +691,12 @@ function googleAuthErrorMessage(err) {
   }
   if (code === "auth/web-storage-unsupported") {
     return "Cookies/storage blocked. Disable private mode or allow site data.";
+  }
+  if (code === "auth/missing-initial-state") {
+    return (
+      "Sign-in session was lost (common on iPhone). Redeploy the latest app, use Safari (not Private Browsing), " +
+      `and in Google Cloud Console add redirect URI: https://${host}/__/auth/handler`
+    );
   }
   return (err && err.message) || "Google sign-in failed.";
 }
@@ -1244,30 +1264,46 @@ document.body.addEventListener("touchmove", (e) => {
   if (isTransmitting) e.preventDefault();
 }, { passive: false });
 
-auth
-  .getRedirectResult()
-  .then((result) => {
+async function initAuth() {
+  const returningFromRedirect = /[?&](apiKey|mode|oobCode)=/.test(location.search);
+  if (returningFromRedirect) {
+    setGoogleBtnLoading(true);
+    signInHint.textContent = "Completing sign-in…";
+  }
+
+  try {
+    const result = await auth.getRedirectResult();
     if (result && result.user) {
       uid = result.user.uid;
       updateAuthUI(result.user);
-    } else if (result && result.credential) {
+      showToast(`Welcome, ${defaultDisplayName(result.user)}`, "success");
+    } else if (result && result.credential && auth.currentUser) {
       updateAuthUI(auth.currentUser);
     }
-  })
-  .catch((err) => {
+  } catch (err) {
     console.error("Redirect sign-in error:", err);
     showError(joinError, googleAuthErrorMessage(err));
-  });
-
-auth.onAuthStateChanged((user) => {
-  if (user && !user.isAnonymous) {
-    uid = user.uid;
-    updateAuthUI(user);
-  } else {
-    uid = null;
-    updateAuthUI(null);
+  } finally {
+    if (returningFromRedirect) {
+      setGoogleBtnLoading(false);
+      if (!auth.currentUser) {
+        signInHint.textContent = "Sign in with Google to continue";
+      }
+    }
   }
-});
+
+  auth.onAuthStateChanged((user) => {
+    if (user && !user.isAnonymous) {
+      uid = user.uid;
+      updateAuthUI(user);
+    } else {
+      uid = null;
+      updateAuthUI(null);
+    }
+  });
+}
+
+initAuth();
 
 if (copyChannelBtn) copyChannelBtn.disabled = true;
 checkMobileAccess();

@@ -371,6 +371,10 @@ function isTunnelHost() {
   return location.hostname.endsWith(".loca.lt") || location.hostname.endsWith(".trycloudflare.com");
 }
 
+function isVercelHost() {
+  return /\.vercel\.app$/i.test(location.hostname);
+}
+
 function checkMobileAccess() {
   const el = document.getElementById("mobile-warning");
   if (!el) return;
@@ -378,23 +382,33 @@ function checkMobileAccess() {
   const onPhone = isMobileDevice();
   const lanIp = isLanHost();
   const tunnel = isTunnelHost();
+  const vercel = isVercelHost();
   const needsHttps = onPhone && !window.isSecureContext;
 
-  if (!onPhone && !lanIp && !tunnel && !needsHttps) return;
+  if (!onPhone && !lanIp && !tunnel && !vercel && !needsHttps) return;
 
   const lines = [];
   if (lanIp) {
-    lines.push("PC IP URLs cannot use Google sign-in. Use localtunnel or Firebase Hosting.");
+    lines.push(
+      "PC IP URLs (http://192.168.x.x) cannot use Google sign-in on iPhone. Use your Vercel HTTPS URL instead."
+    );
   }
   if (needsHttps) {
-    lines.push("Microphone needs HTTPS — use localtunnel or Firebase Hosting.");
+    lines.push("Microphone needs HTTPS — open your Vercel deployment URL on your phone.");
   }
-  if (tunnel) {
+  if (vercel || tunnel) {
     lines.push(
-      `Add this domain in Firebase → Authentication → Settings → Authorized domains:`
+      "Google sign-in on iPhone: add this exact host in Firebase → Authentication → Settings → Authorized domains:"
     );
     lines.push(`<code class="domain-copy">${location.hostname}</code>`);
-    lines.push("Complete the localtunnel password page before signing in with Google.");
+    if (vercel && onPhone) {
+      lines.push(
+        "Use your production URL (e.g. your-app.vercel.app) on iPhone — each preview URL needs its own entry in Firebase."
+      );
+    }
+    if (tunnel) {
+      lines.push("Complete the localtunnel password page before signing in with Google.");
+    }
   }
 
   if (lines.length === 0) return;
@@ -653,10 +667,10 @@ function googleAuthErrorMessage(err) {
   const code = err && err.code;
   const host = location.hostname;
   if (code === "auth/unauthorized-domain") {
-    return `Unauthorized domain. In Firebase Console → Authentication → Authorized domains, add: ${host}`;
+    return `Unauthorized domain for Vercel. Firebase Console → Authentication → Settings → Authorized domains → add: ${host}`;
   }
   if (code === "auth/operation-not-supported-in-this-environment") {
-    return "Sign-in blocked in this browser. Open in Chrome/Safari and allow cookies.";
+    return "Sign-in not supported here. Open in Safari (not in-app browser), disable Private Browsing, and allow cookies.";
   }
   if (code === "auth/popup-blocked") {
     return "Popup blocked. Allow popups for this site, then try again.";
@@ -682,13 +696,16 @@ async function signInWithGoogle() {
     const tunnelish =
       /\.loca\.lt$/i.test(host) ||
       /\.localtunnel\.me$/i.test(host) ||
+      /\.trycloudflare\.com$/i.test(host) ||
       /\.ngrok-free\.app$/i.test(host) ||
       /\.ngrok\.app$/i.test(host) ||
       /\.ngrok\.io$/i.test(host);
+    /** iOS/Android Safari: popups fail or are unsupported — use redirect only. */
     const tryPopup =
       window.isSecureContext &&
       !localhostish &&
-      !tunnelish;
+      !tunnelish &&
+      !isMobileDevice();
 
     if (tryPopup) {
       try {
@@ -698,13 +715,12 @@ async function signInWithGoogle() {
         showToast(`Welcome, ${defaultDisplayName(result.user)}`, "success");
         return;
       } catch (popupErr) {
-        if (
-          popupErr.code !== "auth/popup-blocked" &&
-          popupErr.code !== "auth/cancelled-popup-request" &&
-          popupErr.code !== "auth/popup-closed-by-user"
-        ) {
-          throw popupErr;
-        }
+        const fallbackToRedirect =
+          popupErr.code === "auth/popup-blocked" ||
+          popupErr.code === "auth/cancelled-popup-request" ||
+          popupErr.code === "auth/popup-closed-by-user" ||
+          popupErr.code === "auth/operation-not-supported-in-this-environment";
+        if (!fallbackToRedirect) throw popupErr;
       }
     }
 

@@ -5,6 +5,12 @@ service cloud.firestore {
       return request.auth != null;
     }
 
+    function isMessageSender(channelId, messageId) {
+      return signedIn()
+        && get(/databases/$(database)/documents/channels/$(channelId)/messages/$(messageId)).data.senderId
+           == request.auth.uid;
+    }
+
     match /channels/{channelId} {
       allow read: if signedIn();
       allow create: if signedIn()
@@ -19,6 +25,8 @@ service cloud.firestore {
 
       match /messages/{messageId} {
         allow read: if signedIn();
+
+        // Legacy: one-shot voice message (full blob on document)
         allow create: if signedIn()
           && request.resource.data.senderId == request.auth.uid
           && request.resource.data.keys().hasAll([
@@ -29,7 +37,40 @@ service cloud.firestore {
           && request.resource.data.size is int
           && request.resource.data.size > 0
           && request.resource.data.size <= 786432;
-        allow update, delete: if false;
+
+        // Real-time: stream chunks while holding PTT
+        allow create: if signedIn()
+          && request.resource.data.senderId == request.auth.uid
+          && request.resource.data.streaming == true
+          && request.resource.data.chunkCount == 0
+          && request.resource.data.keys().hasAll([
+               'senderId', 'senderName', 'mimeType', 'streaming', 'chunkCount', 'createdAt'
+             ]);
+
+        allow update: if signedIn()
+          && resource.data.senderId == request.auth.uid
+          && resource.data.streaming == true
+          && request.resource.data.streaming == false
+          && request.resource.data.chunkCount is int
+          && request.resource.data.chunkCount > 0
+          && request.resource.data.chunkCount <= 600;
+
+        allow delete: if false;
+
+        match /chunks/{chunkId} {
+          allow read: if signedIn();
+          allow create: if isMessageSender(channelId, messageId)
+            && request.resource.data.keys().hasAll(['seq', 'audioBase64', 'size'])
+            && request.resource.data.seq is int
+            && request.resource.data.seq >= 0
+            && request.resource.data.seq < 600
+            && request.resource.data.audioBase64 is string
+            && request.resource.data.audioBase64.size() <= 87040
+            && request.resource.data.size is int
+            && request.resource.data.size > 0
+            && request.resource.data.size <= 65536;
+          allow update, delete: if false;
+        }
       }
 
       match /chat/{messageId} {

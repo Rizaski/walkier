@@ -28,6 +28,9 @@ const auth = firebase.auth();
 const firestore = firebase.firestore();
 const FieldValue = firebase.firestore.FieldValue;
 const MAX_AUDIO_BYTES = 750000;
+const PTT_CHUNK_MS = 80;
+const MAX_CHUNK_BYTES = 48000;
+const VOICE_BITS_PER_SECOND = 32000;
 
 // --- DOM ---
 const joinScreen = document.getElementById("join-screen");
@@ -93,6 +96,13 @@ let userPhotoURL = null;
 let mediaStream = null;
 let mediaRecorder = null;
 let recordedChunks = [];
+let activeTxMessageRef = null;
+let activeTxMimeType = "";
+let activeTxSeq = -1;
+let txChunkUploadQueue = [];
+let txChunkUploadBusy = false;
+const streamSessions = new Map();
+const streamChunkUnsubs = new Map();
 let isTransmitting = false;
 let micReady = false;
 const playedMessageIds = new Set();
@@ -101,7 +111,9 @@ let isPlaying = false;
 
 let swRegistration = null;
 let notificationsReady = false;
-let keepAliveAudio = null;
+let channelSilenceLoopActive = false;
+let lockScreenArtworkUrl = null;
+let mediaSessionHandlersReady = false;
 const SILENT_WAV =
   "data:audio/wav;base64,UklGRigAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=";
 
@@ -492,6 +504,22 @@ function blobToBase64(blob) {
   });
 }
 
+function bytesToBase64(bytes) {
+  let binary = "";
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+  }
+  return btoa(binary);
+}
+
+function base64ToBytes(b64) {
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
 const playbackObjectUrls = new Set();
 
 function revokePlaybackObjectUrl(url) {
@@ -502,6 +530,11 @@ function revokePlaybackObjectUrl(url) {
 
 function getMessageAudioSrc(msg) {
   if (msg.audioUrl) return msg.audioUrl;
+  if (msg._audioBlob) {
+    const url = URL.createObjectURL(msg._audioBlob);
+    playbackObjectUrls.add(url);
+    return url;
+  }
   if (!msg.audioBase64) return null;
   const mime = msg.mimeType || "audio/webm";
   try {
@@ -704,26 +737,358 @@ async function initMicrophone() {
   }
 }
 
-function startRecording() {
-  if (!mediaStream || isTransmitting) return;
-  const mimeType = getMimeType();
-  const options = mimeType ? { mimeType } : undefined;
+function queueTxChunkUpload(blob) {
+  if (!activeTxMessageRef || blob.size < 1) return;
+  txChunkUploadQueue.push(blob);
+  drainTxChunkUploads();
+}
 
-  recordedChunks = [];
+async function drainTxChunkUploads() {
+  if (txChunkUploadBusy || !activeTxMessageRef) return;
+  txChunkUploadBusy = true;
+  while (txChunkUploadQueue.length > 0 && activeTxMessageRef) {
+    const blob = txChunkUploadQueue.shift();
+    try {
+      await uploadTxChunk(blob);
+    } catch (err) {
+      console.warn("Chunk upload failed:", err);
+    }
+  }
+  txChunkUploadBusy = false;
+}
+
+async function uploadTxChunk(blob) {
+  if (!activeTxMessageRef || blob.size > MAX_CHUNK_BYTES) return;
+  const seq = ++activeTxSeq;
+  const buf = await blob.arrayBuffer();
+  const audioBase64 = bytesToBase64(new Uint8Array(buf));
+  const ref = activeTxMessageRef;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      await ref
+        .collection("chunks")
+        .doc(String(seq).padStart(4, "0"))
+        .set({ seq, audioBase64, size: blob.size });
+      return;
+    } catch (err) {
+      if (attempt === 2) throw err;
+      await new Promise((r) => setTimeout(r, 80 * (attempt + 1)));
+    }
+  }
+}
+
+function mseCodecForMime(mimeType) {
+  const base = (mimeType || "audio/webm").split(";")[0].trim();
+  if (base === "audio/webm") return 'audio/webm; codecs="opus"';
+  if (base === "audio/mp4") return 'audio/mp4; codecs="mp4a.40.2"';
+  return mimeType || base;
+}
+
+function canStreamPlaybackMse(mimeType) {
+  if (!window.MediaSource) return false;
   try {
-    mediaRecorder = new MediaRecorder(mediaStream, options);
-  } catch (e) {
-    mediaRecorder = new MediaRecorder(mediaStream);
+    return MediaSource.isTypeSupported(mseCodecForMime(mimeType));
+  } catch {
+    return false;
+  }
+}
+
+function mergeStreamChunks(session) {
+  const count = session.msg.chunkCount || session.chunks.size;
+  if (!count) return null;
+  const parts = [];
+  for (let i = 0; i < count; i++) {
+    const bytes = session.chunks.get(i);
+    if (!bytes) return null;
+    parts.push(bytes);
+  }
+  return new Blob(parts, { type: session.mimeType || "audio/webm" });
+}
+
+function cleanupStreamSession(messageId) {
+  const unsub = streamChunkUnsubs.get(messageId);
+  if (unsub) unsub();
+  streamChunkUnsubs.delete(messageId);
+  const session = streamSessions.get(messageId);
+  if (session?.mseUrl) revokePlaybackObjectUrl(session.mseUrl);
+  streamSessions.delete(messageId);
+}
+
+function cleanupAllStreamSessions() {
+  streamChunkUnsubs.forEach((unsub) => unsub());
+  streamChunkUnsubs.clear();
+  streamSessions.forEach((_, id) => cleanupStreamSession(id));
+}
+
+function ensureStreamSession(messageId, msg) {
+  let session = streamSessions.get(messageId);
+  if (!session) {
+    session = {
+      msg,
+      mimeType: msg.mimeType || "audio/webm",
+      chunks: new Map(),
+      ended: msg.streaming === false,
+      playing: false,
+      mseStarted: false,
+      pendingMse: [],
+      mseAppending: false,
+    };
+    streamSessions.set(messageId, session);
+  } else {
+    session.msg = msg;
+    if (msg.streaming === false) session.ended = true;
+  }
+  return session;
+}
+
+function subscribeStreamChunks(messageId) {
+  if (streamChunkUnsubs.has(messageId) || !messagesCollectionRef) return;
+  const unsub = messagesCollectionRef
+    .doc(messageId)
+    .collection("chunks")
+    .orderBy("seq", "asc")
+    .onSnapshot((snapshot) => {
+      snapshot.docChanges().forEach((change) => {
+        if (change.type !== "added") return;
+        onStreamChunk(messageId, change.doc.data());
+      });
+    });
+  streamChunkUnsubs.set(messageId, unsub);
+}
+
+function flushMsePending(session) {
+  if (
+    !session.sourceBuffer ||
+    session.mseAppending ||
+    session.pendingMse.length === 0 ||
+    session.sourceBuffer.updating
+  ) {
+    return;
+  }
+  session.mseAppending = true;
+  const bytes = session.pendingMse.shift();
+  try {
+    session.sourceBuffer.appendBuffer(bytes);
+  } catch (err) {
+    console.warn("MSE append failed:", err);
+    session.mseAppending = false;
+    session.mseFailed = true;
+    return;
+  }
+  session.sourceBuffer.addEventListener(
+    "updateend",
+    () => {
+      session.mseAppending = false;
+      flushMsePending(session);
+      if (
+        session.ended &&
+        session.pendingMse.length === 0 &&
+        !session.sourceBuffer.updating
+      ) {
+        try {
+          session.mediaSource.endOfStream();
+        } catch (_) {}
+      }
+    },
+    { once: true }
+  );
+}
+
+async function startMseStreamPlayback(session, messageId) {
+  if (session.mseStarted || session.mseFailed) return;
+  session.mseStarted = true;
+  session.playing = true;
+  playedMessageIds.add(messageId);
+
+  const codec = mseCodecForMime(session.mimeType);
+  const mediaSource = new MediaSource();
+  session.mediaSource = mediaSource;
+  session.mseUrl = URL.createObjectURL(mediaSource);
+  playbackObjectUrls.add(session.mseUrl);
+
+  channelSilenceLoopActive = false;
+  playback.loop = false;
+  playback.pause();
+  playback.src = session.mseUrl;
+  playback.volume = 1;
+
+  incomingName.textContent = session.msg.senderName || "Someone";
+  incomingIndicator.classList.remove("hidden");
+  setPttState("rx");
+  setActivity(`Live · ${session.msg.senderName}`);
+  updateChannelMediaMetadata(session.msg);
+
+  await new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error("MSE timeout")), 4000);
+    mediaSource.addEventListener(
+      "sourceopen",
+      () => {
+        clearTimeout(t);
+        resolve();
+      },
+      { once: true }
+    );
+    mediaSource.addEventListener(
+      "error",
+      () => {
+        clearTimeout(t);
+        reject(new Error("MSE error"));
+      },
+      { once: true }
+    );
+  });
+
+  session.sourceBuffer = mediaSource.addSourceBuffer(codec);
+  session.sourceBuffer.mode = "sequence";
+
+  const ordered = [...session.chunks.keys()].sort((a, b) => a - b);
+  for (const seq of ordered) {
+    session.pendingMse.push(session.chunks.get(seq));
+  }
+  flushMsePending(session);
+  isPlaying = true;
+  const onMsePlaybackEnd = () => {
+    playback.removeEventListener("ended", onMsePlaybackEnd);
+    if (!streamSessions.has(messageId)) return;
+    cleanupStreamSession(messageId);
+    isPlaying = false;
+    incomingIndicator.classList.add("hidden");
+    restoreChannelMediaSession().catch(() => {});
+    if (!isTransmitting) {
+      setPttState("idle");
+      setActivity("Ready");
+    }
+  };
+  playback.addEventListener("ended", onMsePlaybackEnd);
+  await playback.play();
+  notifyIncomingAudio(session.msg);
+  vibrate(40);
+}
+
+function onStreamChunk(messageId, chunk) {
+  if (playedMessageIds.has(messageId) && !streamSessions.get(messageId)?.mseStarted) return;
+  const session = streamSessions.get(messageId);
+  if (!session || session.chunks.has(chunk.seq)) return;
+
+  session.chunks.set(chunk.seq, base64ToBytes(chunk.audioBase64));
+
+  if (!session.playing && canStreamPlaybackMse(session.mimeType)) {
+    const ready = session.chunks.has(0) && (session.chunks.size >= 2 || session.ended);
+    if (ready) {
+      startMseStreamPlayback(session, messageId).catch(() => {
+        session.mseFailed = true;
+        tryCompleteStreamPlayback(messageId);
+      });
+      return;
+    }
   }
 
+  if (session.mseStarted && session.sourceBuffer) {
+    session.pendingMse.push(session.chunks.get(chunk.seq));
+    flushMsePending(session);
+  }
+
+  tryCompleteStreamPlayback(messageId);
+}
+
+function tryCompleteStreamPlayback(messageId) {
+  const session = streamSessions.get(messageId);
+  if (!session || !session.ended) return;
+
+  const count = session.msg.chunkCount || 0;
+  if (count < 1) return;
+  for (let i = 0; i < count; i++) {
+    if (!session.chunks.has(i)) return;
+  }
+
+  if (session.mseStarted && !session.mseFailed) {
+    session.pendingMse = [];
+    for (let i = 0; i < count; i++) {
+      session.pendingMse.push(session.chunks.get(i));
+    }
+    flushMsePending(session);
+    return;
+  }
+
+  if (playedMessageIds.has(messageId)) return;
+
+  const blob = mergeStreamChunks(session);
+  if (!blob) return;
+
+  playedMessageIds.add(messageId);
+  const msg = { ...session.msg, _audioBlob: blob };
+  cleanupStreamSession(messageId);
+  enqueuePlayback(msg);
+  vibrate(40);
+}
+
+function handleStreamingMessage(messageId, msg) {
+  if (playedMessageIds.has(messageId)) return;
+  ensureStreamSession(messageId, msg);
+  subscribeStreamChunks(messageId);
+  if (msg.streaming === true && !isPlaying) {
+    incomingIndicator.classList.remove("hidden");
+    incomingName.textContent = msg.senderName || "Someone";
+    setPttState("rx");
+    setActivity(`Receiving ${msg.senderName || "Someone"}…`);
+  }
+  if (msg.streaming === false) {
+    tryCompleteStreamPlayback(messageId);
+  }
+}
+
+async function startRecording() {
+  if (!mediaStream || isTransmitting || !messagesCollectionRef) return;
+  const mimeType = getMimeType();
+  const recorderOpts = mimeType
+    ? { mimeType, audioBitsPerSecond: VOICE_BITS_PER_SECOND }
+    : { audioBitsPerSecond: VOICE_BITS_PER_SECOND };
+
+  recordedChunks = [];
+  activeTxSeq = -1;
+  activeTxMimeType = mimeType || "audio/webm";
+  activeTxMessageRef = messagesCollectionRef.doc();
+  txChunkUploadQueue = [];
+
+  try {
+    await activeTxMessageRef.set({
+      senderId: uid,
+      senderName: displayName,
+      mimeType: activeTxMimeType,
+      streaming: true,
+      chunkCount: 0,
+      createdAt: FieldValue.serverTimestamp(),
+    });
+  } catch (err) {
+    console.error("Stream start failed:", err);
+    activeTxMessageRef = null;
+    showToast("Could not start transmission", "error");
+    return;
+  }
+
+  try {
+    mediaRecorder = new MediaRecorder(mediaStream, recorderOpts);
+  } catch (e) {
+    try {
+      mediaRecorder = new MediaRecorder(mediaStream, mimeType ? { mimeType } : undefined);
+    } catch {
+      mediaRecorder = new MediaRecorder(mediaStream);
+    }
+  }
+  activeTxMimeType = mediaRecorder.mimeType || activeTxMimeType;
+
   mediaRecorder.ondataavailable = (e) => {
-    if (e.data && e.data.size > 0) recordedChunks.push(e.data);
+    if (e.data && e.data.size > 0) {
+      recordedChunks.push(e.data);
+      queueTxChunkUpload(e.data);
+    }
   };
 
-  mediaRecorder.start(100);
+  mediaRecorder.start(PTT_CHUNK_MS);
   isTransmitting = true;
+  if (channelSilenceLoopActive && playback) playback.pause();
   setPttState("tx");
-  setActivity("Transmitting…");
+  setActivity("Live…");
   playPttStartSound();
   startAudioViz();
   vibrate(30);
@@ -740,6 +1105,9 @@ async function stopRecordingAndSend() {
   setPttState("idle");
   stopAudioViz();
   playPttEndSound();
+  if (channelDocRef && !isPlaying) {
+    startChannelSilenceLoop().catch(() => {});
+  }
 
   if (memberDocRef) {
     memberDocRef.update({ talking: false, talkingAt: null });
@@ -754,29 +1122,52 @@ async function stopRecordingAndSend() {
     else resolve();
   });
 
-  if (recordedChunks.length === 0) {
+  const mimeType = recorder.mimeType || activeTxMimeType || "audio/webm";
+  const txRef = activeTxMessageRef;
+  activeTxMessageRef = null;
+
+  await drainTxChunkUploads();
+
+  const chunkCount = activeTxSeq + 1;
+  activeTxSeq = -1;
+
+  if (chunkCount > 0 && txRef) {
+    try {
+      await txRef.update({ streaming: false, chunkCount });
+      setActivity("Sent");
+      vibrate(20);
+    } catch (err) {
+      console.error("Finalize stream failed:", err);
+      showToast("Send failed — try again", "error");
+    }
+  } else if (txRef) {
+    txRef.delete().catch(() => {});
+  }
+
+  if (chunkCount === 0 && recordedChunks.length > 0) {
+    const blob = new Blob(recordedChunks, { type: mimeType });
+    if (blob.size < 500) {
+      setActivity("Too short — hold longer");
+      vibrate([50, 50]);
+    } else {
+      setActivity("Sending…");
+      try {
+        await uploadAndBroadcast(blob, mimeType);
+        setActivity("Sent");
+        vibrate(20);
+      } catch (err) {
+        console.error("Upload failed:", err);
+        showToast(firebaseErrorMessage(err), "error");
+      }
+    }
+  } else {
     setActivity("Ready");
-    return;
   }
 
-  const mimeType = recorder.mimeType || "audio/webm";
-  const blob = new Blob(recordedChunks, { type: mimeType });
   recordedChunks = [];
-
-  if (blob.size < 500) {
-    setActivity("Too short — hold longer");
-    vibrate([50, 50]);
-    return;
-  }
-
-  setActivity("Sending…");
-  await uploadAndBroadcast(blob, mimeType);
-  setActivity("Sent");
-  showToast("Message sent", "success");
-  vibrate(20);
   setTimeout(() => {
     if (!isTransmitting && !isPlaying) setActivity("Ready");
-  }, 1500);
+  }, 800);
 }
 
 async function uploadAndBroadcast(blob, mimeType) {
@@ -860,57 +1251,121 @@ async function notifyIncomingAudio(message) {
   }
 }
 
-function updateMediaSessionForRx(message) {
-  if (!("mediaSession" in navigator)) return;
-  const sender = message.senderName || "Someone";
+function getLockScreenArtwork() {
+  if (lockScreenArtworkUrl) return lockScreenArtworkUrl;
   try {
-    navigator.mediaSession.metadata = new MediaMetadata({
-      title: sender,
-      artist: channelId ? `WalkieR · ${channelId}` : "WalkieR",
-      album: "Incoming transmission",
+    const canvas = document.createElement("canvas");
+    canvas.width = 512;
+    canvas.height = 512;
+    const ctx = canvas.getContext("2d");
+    const g = ctx.createLinearGradient(0, 0, 512, 512);
+    g.addColorStop(0, "#34d399");
+    g.addColorStop(1, "#059669");
+    ctx.fillStyle = g;
+    if (typeof ctx.roundRect === "function") {
+      ctx.beginPath();
+      ctx.roundRect(0, 0, 512, 512, 112);
+      ctx.fill();
+    } else {
+      ctx.fillRect(0, 0, 512, 512);
+    }
+    ctx.strokeStyle = "rgba(255,255,255,0.2)";
+    ctx.lineWidth = 16;
+    ctx.beginPath();
+    ctx.arc(256, 256, 160, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.fillStyle = "#fff";
+    ctx.fillRect(236, 160, 40, 100);
+    ctx.fillRect(196, 248, 120, 48);
+    lockScreenArtworkUrl = canvas.toDataURL("image/png");
+  } catch {
+    lockScreenArtworkUrl = "/icons/icon.svg";
+  }
+  return lockScreenArtworkUrl;
+}
+
+function setupMediaSessionHandlers() {
+  if (!("mediaSession" in navigator) || mediaSessionHandlersReady) return;
+  try {
+    navigator.mediaSession.setActionHandler("play", async () => {
+      await resumeAudioSession();
+      if (channelDocRef && !isPlaying) {
+        await startChannelSilenceLoop();
+      } else if (playback.src && playback.paused) {
+        await playback.play();
+      }
+      navigator.mediaSession.playbackState = "playing";
     });
+    navigator.mediaSession.setActionHandler("pause", () => {
+      if (playback && !playback.paused) playback.pause();
+      navigator.mediaSession.playbackState = "paused";
+    });
+    mediaSessionHandlersReady = true;
+  } catch (err) {
+    console.warn("Media session handlers failed:", err);
+  }
+}
+
+function updateChannelMediaMetadata(message) {
+  if (!("mediaSession" in navigator)) return;
+  const artwork = [
+    { src: getLockScreenArtwork(), sizes: "512x512", type: "image/png" },
+    { src: "/icons/icon.svg", sizes: "any", type: "image/svg+xml" },
+  ];
+  try {
+    if (message) {
+      const sender = message.senderName || "Someone";
+      navigator.mediaSession.metadata = new MediaMetadata({
+        title: sender,
+        artist: channelId ? `WalkieR · ${channelId}` : "WalkieR",
+        album: "Voice message",
+        artwork,
+      });
+    } else {
+      navigator.mediaSession.metadata = new MediaMetadata({
+        title: channelId ? `#${channelId}` : "WalkieR",
+        artist: "WalkieR — Live channel",
+        album: displayName ? `You: ${displayName}` : "Push-to-talk radio",
+        artwork,
+      });
+    }
     navigator.mediaSession.playbackState = "playing";
   } catch (err) {
-    console.warn("Media session update failed:", err);
+    console.warn("Media session metadata failed:", err);
+  }
+}
+
+function updateMediaPositionFromPlayback() {
+  if (!("mediaSession" in navigator) || !navigator.mediaSession.setPositionState) return;
+  const duration = playback.duration;
+  if (!duration || !Number.isFinite(duration) || duration <= 0) return;
+  try {
+    navigator.mediaSession.setPositionState({
+      duration,
+      playbackRate: playback.playbackRate || 1,
+      position: Math.min(playback.currentTime, duration),
+    });
+  } catch (err) {
+    console.warn("Media position state failed:", err);
   }
 }
 
 function clearMediaSession() {
   if (!("mediaSession" in navigator)) return;
+  stopChannelSilenceLoop(true);
   try {
     navigator.mediaSession.playbackState = "none";
     navigator.mediaSession.metadata = null;
+    if (navigator.mediaSession.setPositionState) {
+      navigator.mediaSession.setPositionState({
+        duration: 0,
+        playbackRate: 1,
+        position: 0,
+      });
+    }
   } catch (err) {
     console.warn("Media session clear failed:", err);
   }
-}
-
-async function startKeepAliveAudio() {
-  if (keepAliveAudio) return;
-  try {
-    keepAliveAudio = new Audio(SILENT_WAV);
-    keepAliveAudio.loop = true;
-    keepAliveAudio.setAttribute("playsinline", "");
-    keepAliveAudio.setAttribute("webkit-playsinline", "");
-    keepAliveAudio.volume = 0.01;
-    keepAliveAudio.preload = "auto";
-    await keepAliveAudio.play();
-  } catch (err) {
-    console.warn("Keep-alive audio failed:", err);
-    keepAliveAudio = null;
-  }
-}
-
-function stopKeepAliveAudio() {
-  if (!keepAliveAudio) return;
-  try {
-    keepAliveAudio.pause();
-    keepAliveAudio.removeAttribute("src");
-    keepAliveAudio.load();
-  } catch (err) {
-    console.warn("Stop keep-alive failed:", err);
-  }
-  keepAliveAudio = null;
 }
 
 async function resumeAudioSession() {
@@ -922,13 +1377,46 @@ async function resumeAudioSession() {
       console.warn("AudioContext resume failed:", err);
     }
   }
-  if (keepAliveAudio && keepAliveAudio.paused) {
-    try {
-      await keepAliveAudio.play();
-    } catch (err) {
-      console.warn("Keep-alive resume failed:", err);
+}
+
+async function startChannelSilenceLoop() {
+  if (!playback || channelSilenceLoopActive || isPlaying) return;
+  try {
+    playback.loop = true;
+    playback.src = SILENT_WAV;
+    playback.volume = 0.01;
+    playback.setAttribute("playsinline", "");
+    playback.setAttribute("webkit-playsinline", "");
+    await waitForPlaybackReady(playback);
+    await playback.play();
+    channelSilenceLoopActive = true;
+    if ("mediaSession" in navigator) {
+      navigator.mediaSession.playbackState = "playing";
     }
+  } catch (err) {
+    console.warn("Channel silence loop failed:", err);
+    channelSilenceLoopActive = false;
   }
+}
+
+function stopChannelSilenceLoop(force = false) {
+  channelSilenceLoopActive = false;
+  if (!playback || (isPlaying && !force)) return;
+  try {
+    playback.pause();
+    playback.loop = false;
+    playback.removeAttribute("src");
+    playback.load();
+    playback.volume = 1;
+  } catch (err) {
+    console.warn("Stop channel silence failed:", err);
+  }
+}
+
+async function restoreChannelMediaSession() {
+  if (!channelDocRef) return;
+  updateChannelMediaMetadata(null);
+  await startChannelSilenceLoop();
 }
 
 async function prepareMobileChannelAudio() {
@@ -940,28 +1428,10 @@ async function prepareMobileChannelAudio() {
   if (Notification.permission === "granted") {
     notificationsReady = true;
   }
-  if (isMobileDevice()) {
-    await startKeepAliveAudio();
-  }
+  setupMediaSessionHandlers();
   await resumeAudioSession();
-  if ("mediaSession" in navigator) {
-    try {
-      navigator.mediaSession.setActionHandler("play", () => resumeAudioSession());
-    } catch (err) {
-      console.warn("Media session handlers failed:", err);
-    }
-  }
-}
-
-function pauseKeepAliveForPlayback() {
-  if (keepAliveAudio && !keepAliveAudio.paused) {
-    keepAliveAudio.pause();
-  }
-}
-
-function resumeKeepAliveAfterPlayback() {
-  if (!channelDocRef || !keepAliveAudio) return;
-  keepAliveAudio.play().catch(() => {});
+  updateChannelMediaMetadata(null);
+  await startChannelSilenceLoop();
 }
 
 function waitForPlaybackReady(el) {
@@ -986,28 +1456,35 @@ function waitForPlaybackReady(el) {
 async function unlockPlaybackElement() {
   if (!playback) return;
   try {
-    playback.src = SILENT_WAV;
-    playback.volume = 0.01;
-    playback.setAttribute("playsinline", "");
-    await playback.play();
-    playback.pause();
-    playback.removeAttribute("src");
-    playback.load();
+    await startChannelSilenceLoop();
+    stopChannelSilenceLoop();
     playback.volume = 1;
   } catch (err) {
     console.warn("Playback unlock failed:", err);
   }
 }
 
-async function playMessageAudio(src) {
-  pauseKeepAliveForPlayback();
+async function playMessageAudio(src, message) {
+  channelSilenceLoopActive = false;
+  playback.loop = false;
+  playback.pause();
   playback.src = src;
-  playback.load();
   playback.volume = 1;
   await waitForPlaybackReady(playback);
+  updateChannelMediaMetadata(message);
+
+  const onTimeUpdate = () => updateMediaPositionFromPlayback();
+  playback.addEventListener("timeupdate", onTimeUpdate);
+
   await playback.play();
+  if ("mediaSession" in navigator) {
+    navigator.mediaSession.playbackState = "playing";
+  }
+  updateMediaPositionFromPlayback();
+
   await new Promise((resolve) => {
     const finish = () => {
+      playback.removeEventListener("timeupdate", onTimeUpdate);
       playback.onended = null;
       playback.onerror = null;
       resolve();
@@ -1034,6 +1511,9 @@ function promptNotificationsAfterJoin() {
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible" && channelDocRef) {
     resumeAudioSession();
+    if (!isPlaying && !channelSilenceLoopActive) {
+      startChannelSilenceLoop();
+    }
     if (playbackQueue.length > 0) processPlaybackQueue();
   }
 });
@@ -1054,7 +1534,7 @@ async function processPlaybackQueue() {
   incomingIndicator.classList.remove("hidden");
   setPttState("rx");
   setActivity(`Listening to ${msg.senderName}`);
-  updateMediaSessionForRx(msg);
+  updateChannelMediaMetadata(msg);
 
   let src = null;
   try {
@@ -1063,7 +1543,7 @@ async function processPlaybackQueue() {
     if (!src) {
       console.warn("Message has no playable audio");
     } else {
-      await playMessageAudio(src);
+      await playMessageAudio(src, msg);
     }
   } catch (e) {
     console.warn("Playback failed:", e);
@@ -1071,12 +1551,11 @@ async function processPlaybackQueue() {
     revokePlaybackObjectUrl(src);
     incomingIndicator.classList.add("hidden");
     isPlaying = false;
-    resumeKeepAliveAfterPlayback();
 
     if (playbackQueue.length > 0) {
       processPlaybackQueue();
     } else {
-      clearMediaSession();
+      await restoreChannelMediaSession();
       if (!isTransmitting) {
         setPttState("idle");
         setActivity("Ready");
@@ -1190,6 +1669,7 @@ function teardownChannelRefs() {
   messagesCollectionRef = null;
   chatCollectionRef = null;
   joinTimestamp = null;
+  cleanupAllStreamSessions();
   unreadChatCount = 0;
   updateChatBadge();
   if (chatMessagesEl) chatMessagesEl.innerHTML = "";
@@ -1262,13 +1742,25 @@ function setupListeners() {
     .limit(50)
     .onSnapshot((snapshot) => {
       snapshot.docChanges().forEach((change) => {
-        if (change.type !== "added") return;
         const msg = change.doc.data();
         const id = change.doc.id;
-        if (!getMessageAudioSrc(msg)) return;
         if (msg.senderId === uid) return;
-        if (playedMessageIds.has(id)) return;
         if (messageCreatedMs(msg) < joinTimestamp - 2000) return;
+
+        const isStream =
+          msg.streaming === true ||
+          (typeof msg.chunkCount === "number" && msg.chunkCount > 0 && !msg.audioBase64);
+
+        if (isStream) {
+          if (change.type === "added" || change.type === "modified") {
+            handleStreamingMessage(id, msg);
+          }
+          return;
+        }
+
+        if (change.type !== "added") return;
+        if (!msg.audioBase64) return;
+        if (playedMessageIds.has(id)) return;
 
         playedMessageIds.add(id);
         enqueuePlayback(msg);
@@ -1331,11 +1823,18 @@ async function leaveChannel() {
   micReady = false;
   pttBtn.disabled = true;
   playedMessageIds.clear();
+  cleanupAllStreamSessions();
+  activeTxMessageRef = null;
+  txChunkUploadQueue = [];
   playbackQueue = [];
+  isPlaying = false;
+  if (playback) {
+    playback.pause();
+    playback.loop = false;
+  }
   incomingIndicator.classList.add("hidden");
   playbackObjectUrls.forEach((url) => URL.revokeObjectURL(url));
   playbackObjectUrls.clear();
-  stopKeepAliveAudio();
   clearMediaSession();
 
   stopAudioViz();

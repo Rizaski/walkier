@@ -99,6 +99,12 @@ const playedMessageIds = new Set();
 let playbackQueue = [];
 let isPlaying = false;
 
+let swRegistration = null;
+let notificationsReady = false;
+let keepAliveAudio = null;
+const SILENT_WAV =
+  "data:audio/wav;base64,UklGRigAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=";
+
 const STORAGE_KEY_NAME = "walkier_display_name";
 const STORAGE_KEY_CHANNEL = "walkier_last_channel";
 const STORAGE_KEY_RECENT = "walkier_recent_channels";
@@ -773,8 +779,165 @@ async function uploadAndBroadcast(blob, mimeType) {
   });
 }
 
+// --- Mobile notifications & background audio ---
+async function registerServiceWorker() {
+  if (!("serviceWorker" in navigator)) return null;
+  try {
+    swRegistration = await navigator.serviceWorker.register("/sw.js");
+    return swRegistration;
+  } catch (err) {
+    console.warn("Service worker registration failed:", err);
+    return null;
+  }
+}
+
+async function ensureNotificationPermission() {
+  if (!("Notification" in window)) return false;
+  if (Notification.permission === "granted") {
+    notificationsReady = true;
+    return true;
+  }
+  if (Notification.permission === "denied") return false;
+  try {
+    const permission = await Notification.requestPermission();
+    notificationsReady = permission === "granted";
+    return notificationsReady;
+  } catch {
+    return false;
+  }
+}
+
+function shouldNotifyForIncoming() {
+  return document.hidden || !document.hasFocus();
+}
+
+async function notifyIncomingAudio(message) {
+  if (!notificationsReady || !shouldNotifyForIncoming()) return;
+
+  const sender = message.senderName || "Someone";
+  const title = `${sender} · voice message`;
+  const body = channelId ? `Channel ${channelId}` : "WalkieR";
+  const tag = `walkier-${channelId || "audio"}`;
+
+  try {
+    if (swRegistration && swRegistration.active) {
+      swRegistration.active.postMessage({
+        type: "walkier-notify",
+        title,
+        body,
+        tag,
+      });
+      return;
+    }
+    if (swRegistration && "showNotification" in swRegistration) {
+      await swRegistration.showNotification(title, {
+        body,
+        tag,
+        renotify: true,
+        vibrate: [120, 60, 120],
+      });
+      return;
+    }
+    new Notification(title, { body, tag, renotify: true });
+  } catch (err) {
+    console.warn("Notification failed:", err);
+  }
+}
+
+function updateMediaSessionForRx(message) {
+  if (!("mediaSession" in navigator)) return;
+  const sender = message.senderName || "Someone";
+  try {
+    navigator.mediaSession.metadata = new MediaMetadata({
+      title: sender,
+      artist: channelId ? `WalkieR · ${channelId}` : "WalkieR",
+      album: "Incoming transmission",
+    });
+    navigator.mediaSession.playbackState = "playing";
+  } catch (err) {
+    console.warn("Media session update failed:", err);
+  }
+}
+
+function clearMediaSession() {
+  if (!("mediaSession" in navigator)) return;
+  try {
+    navigator.mediaSession.playbackState = "none";
+    navigator.mediaSession.metadata = null;
+  } catch (err) {
+    console.warn("Media session clear failed:", err);
+  }
+}
+
+async function startKeepAliveAudio() {
+  if (keepAliveAudio) return;
+  try {
+    keepAliveAudio = new Audio(SILENT_WAV);
+    keepAliveAudio.loop = true;
+    keepAliveAudio.setAttribute("playsinline", "");
+    keepAliveAudio.setAttribute("webkit-playsinline", "");
+    keepAliveAudio.volume = 0.01;
+    keepAliveAudio.preload = "auto";
+    await keepAliveAudio.play();
+  } catch (err) {
+    console.warn("Keep-alive audio failed:", err);
+    keepAliveAudio = null;
+  }
+}
+
+function stopKeepAliveAudio() {
+  if (!keepAliveAudio) return;
+  try {
+    keepAliveAudio.pause();
+    keepAliveAudio.removeAttribute("src");
+    keepAliveAudio.load();
+  } catch (err) {
+    console.warn("Stop keep-alive failed:", err);
+  }
+  keepAliveAudio = null;
+}
+
+async function resumeAudioSession() {
+  const ctx = getPttAudioContext();
+  if (ctx && ctx.state === "suspended") {
+    try {
+      await ctx.resume();
+    } catch (err) {
+      console.warn("AudioContext resume failed:", err);
+    }
+  }
+  if (keepAliveAudio && keepAliveAudio.paused) {
+    try {
+      await keepAliveAudio.play();
+    } catch (err) {
+      console.warn("Keep-alive resume failed:", err);
+    }
+  }
+}
+
+async function prepareMobileChannelAudio() {
+  playback.setAttribute("playsinline", "");
+  playback.setAttribute("webkit-playsinline", "");
+  await registerServiceWorker();
+  await ensureNotificationPermission();
+  await startKeepAliveAudio();
+  await resumeAudioSession();
+  if ("mediaSession" in navigator) {
+    navigator.mediaSession.setActionHandler("play", () => resumeAudioSession());
+    navigator.mediaSession.setActionHandler("pause", () => {});
+  }
+}
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible" && channelDocRef) {
+    resumeAudioSession();
+    if (playbackQueue.length > 0) processPlaybackQueue();
+  }
+});
+
 // --- Playback queue ---
 function enqueuePlayback(message) {
+  notifyIncomingAudio(message);
   playbackQueue.push(message);
   processPlaybackQueue();
 }
@@ -788,12 +951,15 @@ async function processPlaybackQueue() {
   incomingIndicator.classList.remove("hidden");
   setPttState("rx");
   setActivity(`Listening to ${msg.senderName}`);
+  updateMediaSessionForRx(msg);
+  await resumeAudioSession();
 
   try {
     const src = getMessageAudioSrc(msg);
     if (!src) return;
     playback.src = src;
     playback.load();
+    playback.volume = 1;
     await playback.play();
     await new Promise((resolve) => {
       playback.onended = resolve;
@@ -808,9 +974,12 @@ async function processPlaybackQueue() {
 
   if (playbackQueue.length > 0) {
     processPlaybackQueue();
-  } else if (!isTransmitting) {
-    setPttState("idle");
-    setActivity("Ready");
+  } else {
+    clearMediaSession();
+    if (!isTransmitting) {
+      setPttState("idle");
+      setActivity("Ready");
+    }
   }
 }
 
@@ -877,6 +1046,12 @@ async function joinChannel(name, channel) {
 
     joinTimestamp = Date.now();
     setupListeners();
+    await prepareMobileChannelAudio();
+    if (notificationsReady) {
+      showToast("Notifications on for background voice alerts", "success");
+    } else if ("Notification" in window && Notification.permission !== "denied") {
+      showToast("Allow notifications when prompted for alerts while away", "info");
+    }
     await initMicrophone();
 
     saveRecentChannel(channelId);
@@ -1059,6 +1234,8 @@ async function leaveChannel() {
   playedMessageIds.clear();
   playbackQueue = [];
   incomingIndicator.classList.add("hidden");
+  stopKeepAliveAudio();
+  clearMediaSession();
 
   stopAudioViz();
   setPttState("idle");
@@ -1166,6 +1343,7 @@ async function initAuth() {
 }
 
 initAuth();
+registerServiceWorker();
 
 if (copyChannelBtn) copyChannelBtn.disabled = true;
 checkMobileAccess();

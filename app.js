@@ -117,6 +117,127 @@ let audioAnalyserRaf = null;
 const googleProvider = new firebase.auth.GoogleAuthProvider();
 googleProvider.setCustomParameters({ prompt: "select_account" });
 
+let cachedGoogleWebClientId = null;
+
+async function fetchGoogleWebClientId() {
+  if (cachedGoogleWebClientId) return cachedGoogleWebClientId;
+  const res = await fetch(
+    `https://identitytoolkit.googleapis.com/v1/accounts:createAuthUri?key=${firebaseConfig.apiKey}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        continueUri: `${location.origin}/`,
+        providerId: "google.com",
+      }),
+    }
+  );
+  const data = await res.json();
+  if (!res.ok) {
+    throw new Error(data.error?.message || "Could not load Google Sign-In configuration.");
+  }
+  const match = data.authUri && data.authUri.match(/client_id=([^&]+)/);
+  cachedGoogleWebClientId = match ? decodeURIComponent(match[1]) : null;
+  return cachedGoogleWebClientId;
+}
+
+function ensureGsiLoaded() {
+  if (window.google?.accounts?.id) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const existing = document.querySelector("script[data-walkier-gsi]");
+    if (existing) {
+      existing.addEventListener("load", () => resolve(), { once: true });
+      existing.addEventListener("error", () => reject(new Error("Could not load Google Sign-In.")), {
+        once: true,
+      });
+      return;
+    }
+    const script = document.createElement("script");
+    script.src = "https://accounts.google.com/gsi/client";
+    script.async = true;
+    script.defer = true;
+    script.dataset.walkierGsi = "1";
+    script.onload = () => resolve();
+    script.onerror = () => reject(new Error("Could not load Google Sign-In."));
+    document.head.appendChild(script);
+  });
+}
+
+/** Google Identity Services → Firebase credential (no redirect_uri; reliable on iOS/Android). */
+function signInWithGoogleCredentialUi() {
+  return new Promise(async (resolve, reject) => {
+    let settled = false;
+    const finish = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      fn(value);
+    };
+
+    try {
+      const clientId = await fetchGoogleWebClientId();
+      if (!clientId) throw new Error("Google Sign-In is not enabled in Firebase.");
+      await ensureGsiLoaded();
+
+      const overlay = document.createElement("div");
+      overlay.className = "gsi-overlay";
+      overlay.setAttribute("role", "dialog");
+      overlay.setAttribute("aria-modal", "true");
+      overlay.innerHTML =
+        '<div class="gsi-panel">' +
+        '<p class="gsi-title">Sign in with Google</p>' +
+        '<div id="gsi-button-host"></div>' +
+        '<button type="button" class="gsi-cancel">Cancel</button>' +
+        "</div>";
+
+      const host = overlay.querySelector("#gsi-button-host");
+      const cancelBtn = overlay.querySelector(".gsi-cancel");
+
+      const cleanup = () => {
+        overlay.remove();
+        document.body.classList.remove("gsi-open");
+      };
+
+      cancelBtn.addEventListener("click", () => {
+        cleanup();
+        finish(reject, Object.assign(new Error("Sign-in cancelled."), { code: "auth/cancelled-popup-request" }));
+      });
+
+      overlay.addEventListener("click", (e) => {
+        if (e.target === overlay) cancelBtn.click();
+      });
+
+      google.accounts.id.initialize({
+        client_id: clientId,
+        callback: async (response) => {
+          cleanup();
+          try {
+            const credential = firebase.auth.GoogleAuthProvider.credential(response.credential);
+            finish(resolve, await auth.signInWithCredential(credential));
+          } catch (err) {
+            finish(reject, err);
+          }
+        },
+        auto_select: false,
+        cancel_on_tap_outside: false,
+        itp_support: true,
+      });
+
+      google.accounts.id.renderButton(host, {
+        type: "standard",
+        theme: "outline",
+        size: "large",
+        text: "signin_with",
+        width: 300,
+      });
+
+      document.body.classList.add("gsi-open");
+      document.body.appendChild(overlay);
+    } catch (err) {
+      finish(reject, err);
+    }
+  });
+}
+
 // Restore saved values
 const savedName = localStorage.getItem(STORAGE_KEY_NAME);
 const savedChannel = localStorage.getItem(STORAGE_KEY_CHANNEL);
@@ -693,12 +814,22 @@ function googleAuthErrorMessage(err) {
     return "Cookies/storage blocked. Disable private mode or allow site data.";
   }
   if (code === "auth/missing-initial-state") {
-    return (
-      "Sign-in session was lost (common on iPhone). Redeploy the latest app, use Safari (not Private Browsing), " +
-      `and in Google Cloud Console add redirect URI: https://${host}/__/auth/handler`
-    );
+    return "Sign-in session was lost. Use Safari or Chrome (not in-app browser) and disable Private Browsing.";
   }
   return (err && err.message) || "Google sign-in failed.";
+}
+
+function isAuthHostSupported() {
+  const host = location.hostname;
+  const localhostish =
+    host === "localhost" || host === "127.0.0.1" || /^127\.\d+\.\d+\.\d+$/.test(host);
+  return window.isSecureContext && !localhostish && !isTunnelHost();
+}
+
+function applyGoogleSignInResult(result) {
+  uid = result.user.uid;
+  updateAuthUI(result.user);
+  showToast(`Welcome, ${defaultDisplayName(result.user)}`, "success");
 }
 
 async function signInWithGoogle() {
@@ -708,46 +839,44 @@ async function signInWithGoogle() {
   try {
     await auth.setPersistence(firebase.auth.Auth.Persistence.LOCAL);
 
-    // Popup works on real deployed origins; localhost & tunnels → redirect
-    const host = location.hostname;
-    const localhostish =
-      host === "localhost" || host === "127.0.0.1" || /^127\.\d+\.\d+\.\d+$/.test(host);
-    /** Popups often break through tunnels (COOP / opener); redirect is reliable on HTTPS. */
-    const tunnelish =
-      /\.loca\.lt$/i.test(host) ||
-      /\.localtunnel\.me$/i.test(host) ||
-      /\.trycloudflare\.com$/i.test(host) ||
-      /\.ngrok-free\.app$/i.test(host) ||
-      /\.ngrok\.app$/i.test(host) ||
-      /\.ngrok\.io$/i.test(host);
-    /** iOS/Android Safari: popups fail or are unsupported — use redirect only. */
-    const tryPopup =
-      window.isSecureContext &&
-      !localhostish &&
-      !tunnelish &&
-      !isMobileDevice();
-
-    if (tryPopup) {
+    if (window.isSecureContext && !isTunnelHost()) {
       try {
-        const result = await auth.signInWithPopup(googleProvider);
-        uid = result.user.uid;
-        updateAuthUI(result.user);
-        showToast(`Welcome, ${defaultDisplayName(result.user)}`, "success");
+        applyGoogleSignInResult(await signInWithGoogleCredentialUi());
+        return;
+      } catch (gsiErr) {
+        if (
+          gsiErr.code === "auth/cancelled-popup-request" ||
+          gsiErr.code === "auth/popup-closed-by-user"
+        ) {
+          return;
+        }
+        console.warn("GIS sign-in failed, trying fallback:", gsiErr);
+      }
+    }
+
+    if (isAuthHostSupported()) {
+      try {
+        applyGoogleSignInResult(await auth.signInWithPopup(googleProvider));
         return;
       } catch (popupErr) {
-        const fallbackToRedirect =
+        const popupRecoverable =
           popupErr.code === "auth/popup-blocked" ||
           popupErr.code === "auth/cancelled-popup-request" ||
           popupErr.code === "auth/popup-closed-by-user" ||
           popupErr.code === "auth/operation-not-supported-in-this-environment";
-        if (!fallbackToRedirect) throw popupErr;
+        if (!popupRecoverable) throw popupErr;
       }
+      await auth.signInWithRedirect(googleProvider);
+      return;
     }
 
-    await auth.signInWithRedirect(googleProvider);
+    throw new Error("Google sign-in needs HTTPS. Open your deployed app URL on this device.");
   } catch (err) {
     console.error("Google sign-in error:", err);
-    if (err.code !== "auth/popup-closed-by-user") {
+    if (
+      err.code !== "auth/popup-closed-by-user" &&
+      err.code !== "auth/cancelled-popup-request"
+    ) {
       showError(joinError, googleAuthErrorMessage(err));
     }
   } finally {

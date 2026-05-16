@@ -114,6 +114,7 @@ let isPlaying = false;
 
 let swRegistration = null;
 let notificationsReady = false;
+let lastTalkingNotifyId = null;
 let channelSilenceLoopActive = false;
 let lockScreenArtworkUrl = null;
 let mediaSessionHandlersReady = false;
@@ -484,7 +485,7 @@ function sanitizeChannel(raw) {
 function firebaseErrorMessage(err) {
   const code = err && err.code;
   if (code === "permission-denied") {
-    return "Firestore permission denied. Enable Firestore and deploy firestore.rules.";
+    return "Permission denied — deploy the latest firestore.rules in Firebase Console.";
   }
   if (code === "unavailable" || code === "failed-precondition") {
     return "Firestore is unavailable. Enable it in Firebase Console.";
@@ -1117,26 +1118,7 @@ async function startRecording() {
     : { audioBitsPerSecond: VOICE_BITS_PER_SECOND };
 
   recordedChunks = [];
-  activeTxSeq = -1;
   activeTxMimeType = mimeType || "audio/webm";
-  activeTxMessageRef = messagesCollectionRef.doc();
-  txChunkUploadQueue = [];
-
-  try {
-    await activeTxMessageRef.set({
-      senderId: uid,
-      senderName: displayName,
-      mimeType: activeTxMimeType,
-      streaming: true,
-      chunkCount: 0,
-      createdAt: FieldValue.serverTimestamp(),
-    });
-  } catch (err) {
-    console.error("Stream start failed:", err);
-    activeTxMessageRef = null;
-    showToast("Could not start transmission", "error");
-    return;
-  }
 
   try {
     mediaRecorder = new MediaRecorder(mediaStream, recorderOpts);
@@ -1150,10 +1132,7 @@ async function startRecording() {
   activeTxMimeType = mediaRecorder.mimeType || activeTxMimeType;
 
   mediaRecorder.ondataavailable = (e) => {
-    if (e.data && e.data.size > 0) {
-      recordedChunks.push(e.data);
-      queueTxChunkUpload(e.data);
-    }
+    if (e.data && e.data.size > 0) recordedChunks.push(e.data);
   };
 
   mediaRecorder.start(PTT_CHUNK_MS);
@@ -1195,48 +1174,25 @@ async function stopRecordingAndSend() {
   });
 
   const mimeType = recorder.mimeType || activeTxMimeType || "audio/webm";
-  const txRef = activeTxMessageRef;
-  activeTxMessageRef = null;
+  const chunks = recordedChunks.splice(0);
+  const blob = new Blob(chunks, { type: mimeType });
 
-  await drainTxChunkUploads();
-
-  const chunkCount = activeTxSeq + 1;
-  activeTxSeq = -1;
-
-  if (chunkCount > 0 && txRef) {
+  if (blob.size < 500) {
+    setActivity("Too short — hold longer");
+    vibrate([50, 50]);
+  } else {
+    setActivity("Sending…");
     try {
-      await txRef.update({ streaming: false, chunkCount });
+      await uploadAndBroadcast(blob, mimeType);
       setActivity("Sent");
       vibrate(20);
+      showToast("Message sent", "success");
     } catch (err) {
-      console.error("Finalize stream failed:", err);
-      showToast("Send failed — try again", "error");
+      console.error("Upload failed:", err);
+      showToast(firebaseErrorMessage(err), "error");
+      setActivity("Send failed");
     }
-  } else if (txRef) {
-    txRef.delete().catch(() => {});
   }
-
-  if (chunkCount === 0 && recordedChunks.length > 0) {
-    const blob = new Blob(recordedChunks, { type: mimeType });
-    if (blob.size < 500) {
-      setActivity("Too short — hold longer");
-      vibrate([50, 50]);
-    } else {
-      setActivity("Sending…");
-      try {
-        await uploadAndBroadcast(blob, mimeType);
-        setActivity("Sent");
-        vibrate(20);
-      } catch (err) {
-        console.error("Upload failed:", err);
-        showToast(firebaseErrorMessage(err), "error");
-      }
-    }
-  } else {
-    setActivity("Ready");
-  }
-
-  recordedChunks = [];
   setTimeout(() => {
     if (!isTransmitting && !isPlaying) setActivity("Ready");
   }, 800);
@@ -1262,12 +1218,18 @@ async function uploadAndBroadcast(blob, mimeType) {
 async function registerServiceWorker() {
   if (!("serviceWorker" in navigator)) return null;
   try {
-    swRegistration = await navigator.serviceWorker.register("/sw.js");
+    swRegistration = await navigator.serviceWorker.register("/sw.js", { scope: "/" });
+    await navigator.serviceWorker.ready;
     return swRegistration;
   } catch (err) {
     console.warn("Service worker registration failed:", err);
     return null;
   }
+}
+
+function syncNotificationReadyState() {
+  notificationsReady =
+    typeof Notification !== "undefined" && Notification.permission === "granted";
 }
 
 async function ensureNotificationPermission() {
@@ -1276,7 +1238,7 @@ async function ensureNotificationPermission() {
     return false;
   }
   if (Notification.permission === "granted") {
-    notificationsReady = true;
+    syncNotificationReadyState();
     updateNotifyBanner();
     return true;
   }
@@ -1287,7 +1249,7 @@ async function ensureNotificationPermission() {
   try {
     await registerServiceWorker();
     const permission = await Notification.requestPermission();
-    notificationsReady = permission === "granted";
+    syncNotificationReadyState();
     updateNotifyBanner();
     return notificationsReady;
   } catch {
@@ -1330,7 +1292,7 @@ function updateNotifyBanner() {
 function requestNotificationsFromUserGesture() {
   if (!("Notification" in window) || Notification.permission !== "default") return;
   Notification.requestPermission().then((permission) => {
-    notificationsReady = permission === "granted";
+    syncNotificationReadyState();
     updateNotifyBanner();
     if (permission === "granted") {
       showToast("Notifications enabled", "success");
@@ -1341,47 +1303,96 @@ function requestNotificationsFromUserGesture() {
 async function enableNotificationsFromButton() {
   const granted = await ensureNotificationPermission();
   if (granted) {
-    showToast("Notifications enabled for voice alerts", "success");
+    syncNotificationReadyState();
+    const ok = await showWalkieNotification(
+      "WalkieR",
+      "You'll get alerts when someone talks on your channel.",
+      "walkier-test"
+    );
+    showToast(
+      ok ? "Notifications enabled" : "Permission granted — alerts will appear in the background",
+      "success"
+    );
   } else if (Notification.permission === "denied") {
     showToast("Enable notifications in system Settings", "info");
   }
 }
 
 function shouldNotifyForIncoming() {
-  return document.hidden || !document.hasFocus();
+  if (document.visibilityState === "hidden" || document.hidden) return true;
+  if (!document.hasFocus()) return true;
+  if (currentTab !== "radio") return true;
+  return false;
 }
 
-async function notifyIncomingAudio(message) {
-  if (!notificationsReady || !shouldNotifyForIncoming()) return;
-
-  const sender = message.senderName || "Someone";
-  const title = `${sender} · voice message`;
-  const body = channelId ? `Channel ${channelId}` : "WalkieR";
-  const tag = `walkier-${channelId || "audio"}`;
+async function showWalkieNotification(title, body, tag = "walkier-audio") {
+  if (typeof Notification === "undefined" || Notification.permission !== "granted") {
+    return false;
+  }
+  const options = {
+    body,
+    tag,
+    renotify: true,
+    icon: "/icons/icon.svg",
+    badge: "/icons/icon.svg",
+    vibrate: [120, 60, 120],
+    data: { url: "/" },
+  };
 
   try {
-    if (swRegistration && swRegistration.active) {
+    const reg = swRegistration || (await navigator.serviceWorker.ready);
+    if (reg?.showNotification) {
+      await reg.showNotification(title, options);
+      return true;
+    }
+  } catch (err) {
+    console.warn("Service worker notification failed:", err);
+  }
+
+  try {
+    if (swRegistration?.active) {
       swRegistration.active.postMessage({
         type: "walkier-notify",
         title,
         body,
         tag,
       });
-      return;
+      return true;
     }
-    if (swRegistration && "showNotification" in swRegistration) {
-      await swRegistration.showNotification(title, {
-        body,
-        tag,
-        renotify: true,
-        vibrate: [120, 60, 120],
-      });
-      return;
-    }
-    new Notification(title, { body, tag, renotify: true });
+  } catch (err) {
+    console.warn("Notification postMessage failed:", err);
+  }
+
+  try {
+    new Notification(title, options);
+    return true;
   } catch (err) {
     console.warn("Notification failed:", err);
+    return false;
   }
+}
+
+async function notifyIncomingAudio(message) {
+  if (Notification.permission !== "granted") return;
+  if (!shouldNotifyForIncoming()) return;
+
+  const sender = message.senderName || "Someone";
+  await showWalkieNotification(
+    `${sender} · WalkieR`,
+    channelId ? `Voice message on #${channelId}` : "Incoming voice message",
+    `walkier-voice-${channelId || "ch"}-${message.senderId || "x"}`
+  );
+}
+
+async function notifySomeoneTalking(name, memberId) {
+  if (Notification.permission !== "granted") return;
+  if (!shouldNotifyForIncoming()) return;
+
+  await showWalkieNotification(
+    `${name} is talking`,
+    channelId ? `Channel #${channelId}` : "WalkieR",
+    `walkier-talking-${channelId || "ch"}-${memberId}`
+  );
 }
 
 function getLockScreenArtwork() {
@@ -1558,9 +1569,7 @@ async function prepareMobileChannelAudio() {
     playback.setAttribute("webkit-playsinline", "");
   }
   await registerServiceWorker();
-  if (Notification.permission === "granted") {
-    notificationsReady = true;
-  }
+  syncNotificationReadyState();
   setupMediaSessionHandlers();
   await resumeAudioSession();
   updateChannelMediaMetadata(null);
@@ -1869,6 +1878,12 @@ function setupListeners() {
         if (talking && !isYou) {
           incomingIndicator.classList.remove("hidden");
           incomingName.textContent = member.name || "Someone";
+          if (id !== lastTalkingNotifyId) {
+            lastTalkingNotifyId = id;
+            notifySomeoneTalking(member.name || "Someone", id);
+          }
+        } else if (id === lastTalkingNotifyId) {
+          lastTalkingNotifyId = null;
         }
       });
 
@@ -1966,6 +1981,7 @@ async function leaveChannel() {
   micReady = false;
   pttBtn.disabled = true;
   playedMessageIds.clear();
+  lastTalkingNotifyId = null;
   cleanupAllStreamSessions();
   updateNotifyBanner();
   activeTxMessageRef = null;
@@ -2093,8 +2109,9 @@ async function initAuth() {
   });
 }
 
+syncNotificationReadyState();
 initAuth();
-registerServiceWorker();
+registerServiceWorker().then(() => syncNotificationReadyState());
 
 if (copyChannelBtn) copyChannelBtn.disabled = true;
 checkMobileAccess();

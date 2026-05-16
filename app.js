@@ -31,6 +31,7 @@ const MAX_AUDIO_BYTES = 750000;
 const PTT_CHUNK_MS = 80;
 const MAX_CHUNK_BYTES = 48000;
 const VOICE_BITS_PER_SECOND = 32000;
+const TALKING_STALE_MS = 12000;
 
 // --- DOM ---
 const joinScreen = document.getElementById("join-screen");
@@ -115,6 +116,7 @@ let isPlaying = false;
 let swRegistration = null;
 let notificationsReady = false;
 let lastTalkingNotifyId = null;
+let lastMemberEntries = [];
 let channelSilenceLoopActive = false;
 let lockScreenArtworkUrl = null;
 let mediaSessionHandlersReady = false;
@@ -124,6 +126,7 @@ const SILENT_WAV =
 const STORAGE_KEY_NAME = "walkier_display_name";
 const STORAGE_KEY_CHANNEL = "walkier_last_channel";
 const STORAGE_KEY_RECENT = "walkier_recent_channels";
+const STORAGE_KEY_AUTO_JOIN = "walkier_auto_rejoin";
 
 let audioAnalyser = null;
 let audioAnalyserRaf = null;
@@ -135,6 +138,22 @@ const savedChannel = localStorage.getItem(STORAGE_KEY_CHANNEL);
 if (savedName) displayNameInput.value = savedName;
 if (savedChannel) channelIdInput.value = savedChannel;
 renderRecentChannels();
+
+function persistJoinForm() {
+  const name = (displayNameInput?.value || "").trim().slice(0, 24);
+  const channel = sanitizeChannel(channelIdInput?.value || "");
+  if (name) localStorage.setItem(STORAGE_KEY_NAME, name);
+  if (channel) localStorage.setItem(STORAGE_KEY_CHANNEL, channel);
+}
+
+if (displayNameInput) {
+  displayNameInput.addEventListener("input", persistJoinForm);
+  displayNameInput.addEventListener("change", persistJoinForm);
+}
+if (channelIdInput) {
+  channelIdInput.addEventListener("input", persistJoinForm);
+  channelIdInput.addEventListener("change", persistJoinForm);
+}
 
 // --- Toasts ---
 function showToast(message, type = "info") {
@@ -580,14 +599,61 @@ function updateChannelPreview() {
 }
 
 function getMimeType() {
-  const ios = /iPhone|iPad|iPod/i.test(navigator.userAgent);
-  const types = ios
-    ? ["audio/mp4", "audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus"]
-    : ["audio/webm;codecs=opus", "audio/webm", "audio/mp4", "audio/ogg;codecs=opus"];
+  const types = [
+    "audio/mp4",
+    "audio/webm;codecs=opus",
+    "audio/webm",
+    "audio/ogg;codecs=opus",
+  ];
   for (const t of types) {
     if (MediaRecorder.isTypeSupported(t)) return t;
   }
   return "";
+}
+
+function memberTimestampMs(value) {
+  if (!value) return 0;
+  if (typeof value.toMillis === "function") return value.toMillis();
+  if (typeof value === "number") return value;
+  return 0;
+}
+
+/** Ignore stuck talking flags left after a crash or failed update. */
+function isMemberActivelyTalking(member) {
+  if (!member || member.talking !== true) return false;
+  const at = memberTimestampMs(member.talkingAt);
+  if (!at) return true;
+  return Date.now() - at < TALKING_STALE_MS;
+}
+
+function canPlayMimeType(mimeType) {
+  if (!playback) return true;
+  const mime = (mimeType || "audio/mp4").split(";")[0].trim();
+  if (typeof playback.canPlayType !== "function") return true;
+  const hint = playback.canPlayType(mime);
+  return hint === "probably" || hint === "maybe";
+}
+
+function refreshIncomingFromMembers(entries) {
+  const active = entries.find(([id, m]) => id !== uid && isMemberActivelyTalking(m));
+  if (active) {
+    const [, member] = active;
+    incomingIndicator.classList.remove("hidden");
+    incomingName.textContent = member.name || "Someone";
+    return;
+  }
+  if (!isReceivingAudio() && !isTransmitting) {
+    incomingIndicator.classList.add("hidden");
+    if (!isPlaying) {
+      setPttState("idle");
+      setActivity("Ready");
+    }
+  }
+}
+
+function resetIncomingUi() {
+  if (isReceivingAudio() || isTransmitting) return;
+  refreshIncomingFromMembers(lastMemberEntries);
 }
 
 function vibrate(ms) {
@@ -1001,12 +1067,8 @@ async function startMseStreamPlayback(session, messageId) {
     if (!streamSessions.has(messageId)) return;
     cleanupStreamSession(messageId);
     isPlaying = false;
-    incomingIndicator.classList.add("hidden");
     restoreChannelMediaSession().catch(() => {});
-    if (!isTransmitting) {
-      setPttState("idle");
-      setActivity("Ready");
-    }
+    resetIncomingUi();
   };
   playback.addEventListener("ended", onMsePlaybackEnd);
   await playback.play();
@@ -1095,18 +1157,16 @@ function tryCompleteStreamPlayback(messageId) {
   vibrate(40);
 }
 
+/** Legacy stream docs without audioBase64 — do not block the UI; play only full messages. */
 function handleStreamingMessage(messageId, msg) {
-  if (playedMessageIds.has(messageId)) return;
-  ensureStreamSession(messageId, msg);
-  subscribeStreamChunks(messageId);
-  if (msg.streaming === true && !isReceivingAudio()) {
-    incomingIndicator.classList.remove("hidden");
-    incomingName.textContent = msg.senderName || "Someone";
-    setPttState("rx");
-    setActivity(`Receiving ${msg.senderName || "Someone"}…`);
+  if (msg.audioBase64 && msg.size > 0) {
+    if (playedMessageIds.has(messageId)) return;
+    playedMessageIds.add(messageId);
+    enqueuePlayback(msg);
+    return;
   }
   if (msg.streaming === false) {
-    tryCompleteStreamPlayback(messageId);
+    cleanupStreamSession(messageId);
   }
 }
 
@@ -1156,46 +1216,49 @@ async function stopRecordingAndSend() {
   setPttState("idle");
   stopAudioViz();
   playPttEndSound();
+  if (memberDocRef) {
+    memberDocRef
+      .update({ talking: false, talkingAt: null })
+      .catch((err) => console.warn("Clear talking failed:", err));
+  }
   if (channelDocRef && !isReceivingAudio()) {
     startChannelSilenceLoop().catch(() => {});
-  }
-
-  if (memberDocRef) {
-    memberDocRef.update({ talking: false, talkingAt: null });
   }
 
   const recorder = mediaRecorder;
   mediaRecorder = null;
 
-  await new Promise((resolve) => {
-    recorder.onstop = resolve;
-    if (recorder.state !== "inactive") recorder.stop();
-    else resolve();
-  });
+  try {
+    await new Promise((resolve) => {
+      recorder.onstop = resolve;
+      if (recorder.state !== "inactive") recorder.stop();
+      else resolve();
+    });
 
-  const mimeType = recorder.mimeType || activeTxMimeType || "audio/webm";
-  const chunks = recordedChunks.splice(0);
-  const blob = new Blob(chunks, { type: mimeType });
+    const mimeType = recorder.mimeType || activeTxMimeType || "audio/mp4";
+    const chunks = recordedChunks.splice(0);
+    const blob = new Blob(chunks, { type: mimeType });
 
-  if (blob.size < 500) {
-    setActivity("Too short — hold longer");
-    vibrate([50, 50]);
-  } else {
-    setActivity("Sending…");
-    try {
+    if (blob.size < 500) {
+      setActivity("Too short — hold longer");
+      vibrate([50, 50]);
+    } else {
+      setActivity("Sending…");
       await uploadAndBroadcast(blob, mimeType);
       setActivity("Sent");
       vibrate(20);
       showToast("Message sent", "success");
-    } catch (err) {
-      console.error("Upload failed:", err);
-      showToast(firebaseErrorMessage(err), "error");
-      setActivity("Send failed");
     }
+  } catch (err) {
+    console.error("Send failed:", err);
+    showToast(firebaseErrorMessage(err), "error");
+    setActivity("Send failed");
+  } finally {
+    recordedChunks = [];
+    setTimeout(() => {
+      if (!isTransmitting && !isPlaying) setActivity("Ready");
+    }, 800);
   }
-  setTimeout(() => {
-    if (!isTransmitting && !isPlaying) setActivity("Ready");
-  }, 800);
 }
 
 async function uploadAndBroadcast(blob, mimeType) {
@@ -1278,7 +1341,8 @@ function updateNotifyBanner() {
       notifyBannerText.textContent =
         "On iPhone: Share → Add to Home Screen, open WalkieR from the icon, then tap Enable alerts.";
     } else {
-      notifyBannerText.textContent = "Tap Enable alerts to hear when someone talks while the app is in the background.";
+      notifyBannerText.textContent =
+        "Tap Enable alerts for voice and chat messages while the app is in the background.";
     }
   }
 
@@ -1322,6 +1386,13 @@ function shouldNotifyForIncoming() {
   if (document.visibilityState === "hidden" || document.hidden) return true;
   if (!document.hasFocus()) return true;
   if (currentTab !== "radio") return true;
+  return false;
+}
+
+function shouldNotifyForChat() {
+  if (document.visibilityState === "hidden" || document.hidden) return true;
+  if (!document.hasFocus()) return true;
+  if (currentTab !== "chat") return true;
   return false;
 }
 
@@ -1392,6 +1463,19 @@ async function notifySomeoneTalking(name, memberId) {
     `${name} is talking`,
     channelId ? `Channel #${channelId}` : "WalkieR",
     `walkier-talking-${channelId || "ch"}-${memberId}`
+  );
+}
+
+async function notifyIncomingChat(msg) {
+  if (Notification.permission !== "granted") return;
+  if (!shouldNotifyForChat()) return;
+
+  const sender = msg.senderName || "Someone";
+  const preview = (msg.text || "").trim().slice(0, 100);
+  await showWalkieNotification(
+    `${sender} · #${channelId || "chat"}`,
+    preview || "New message",
+    `walkier-chat-${channelId || "ch"}-${msg.senderId || "x"}`
   );
 }
 
@@ -1607,10 +1691,18 @@ async function unlockPlaybackElement() {
 }
 
 async function playMessageAudio(src, message) {
+  const mime = message.mimeType || "audio/mp4";
+  if (!canPlayMimeType(mime)) {
+    showToast("Voice format not supported on this device. Ask sender to update the app.", "error");
+    throw new Error(`Unsupported audio format: ${mime}`);
+  }
+
   stopChannelSilenceLoop(true);
   channelSilenceLoopActive = false;
   playback.loop = false;
   playback.pause();
+  playback.removeAttribute("src");
+  playback.load();
   playback.src = src;
   playback.volume = 1;
   await waitForPlaybackReady(playback);
@@ -1698,19 +1790,16 @@ async function processPlaybackQueue() {
     }
   } catch (e) {
     console.warn("Playback failed:", e);
+    showToast("Could not play voice message", "error");
   } finally {
     revokePlaybackObjectUrl(src);
-    incomingIndicator.classList.add("hidden");
     isPlaying = false;
 
     if (playbackQueue.length > 0) {
       processPlaybackQueue();
     } else {
       await restoreChannelMediaSession();
-      if (!isTransmitting) {
-        setPttState("idle");
-        setActivity("Ready");
-      }
+      resetIncomingUi();
     }
   }
 }
@@ -1741,6 +1830,7 @@ async function joinChannel(name, channel) {
 
     localStorage.setItem(STORAGE_KEY_NAME, displayName);
     localStorage.setItem(STORAGE_KEY_CHANNEL, channelId);
+    localStorage.setItem(STORAGE_KEY_AUTO_JOIN, "1");
     channelIdInput.value = channelId;
 
     channelDocRef = firestore.collection("channels").doc(channelId);
@@ -1764,6 +1854,7 @@ async function joinChannel(name, channel) {
       photoURL: user.photoURL || null,
       joinedAt: FieldValue.serverTimestamp(),
       talking: false,
+      talkingAt: null,
       online: true,
     });
 
@@ -1833,6 +1924,12 @@ function setupListeners() {
   if (messagesUnsubscribe) messagesUnsubscribe();
   if (chatUnsubscribe) chatUnsubscribe();
 
+  cleanupAllStreamSessions();
+  playedMessageIds.clear();
+  playbackQueue = [];
+  isPlaying = false;
+  lastTalkingNotifyId = null;
+
   membersUnsubscribe = channelDocRef.collection("members").onSnapshot((snapshot) => {
     const entries = [];
     snapshot.forEach((doc) => {
@@ -1856,7 +1953,7 @@ function setupListeners() {
         const li = document.createElement("li");
         const initials = (member.name || "?").slice(0, 2).toUpperCase();
         const isYou = id === uid;
-        const talking = member.talking === true;
+        const talking = isMemberActivelyTalking(member);
         const photo = member.photoURL
           ? `<img src="${escapeHtml(member.photoURL)}" alt="" />`
           : initials;
@@ -1875,24 +1972,16 @@ function setupListeners() {
         `;
         membersList.appendChild(li);
 
-        if (talking && !isYou) {
-          incomingIndicator.classList.remove("hidden");
-          incomingName.textContent = member.name || "Someone";
-          if (id !== lastTalkingNotifyId) {
-            lastTalkingNotifyId = id;
-            notifySomeoneTalking(member.name || "Someone", id);
-          }
-        } else if (id === lastTalkingNotifyId) {
+        if (talking && !isYou && id !== lastTalkingNotifyId) {
+          lastTalkingNotifyId = id;
+          notifySomeoneTalking(member.name || "Someone", id);
+        } else if (!talking && id === lastTalkingNotifyId) {
           lastTalkingNotifyId = null;
         }
       });
 
-    const anyoneElseTalking = entries.some(
-      ([id, m]) => id !== uid && m.talking === true
-    );
-    if (!anyoneElseTalking && !isReceivingAudio()) {
-      incomingIndicator.classList.add("hidden");
-    }
+    lastMemberEntries = entries;
+    refreshIncomingFromMembers(entries);
   });
 
   messagesUnsubscribe = messagesCollectionRef
@@ -1900,26 +1989,20 @@ function setupListeners() {
     .limit(50)
     .onSnapshot((snapshot) => {
       snapshot.docChanges().forEach((change) => {
+        if (change.type !== "added" && change.type !== "modified") return;
         const msg = change.doc.data();
         const id = change.doc.id;
         if (msg.senderId === uid) return;
         if (messageCreatedMs(msg) < joinTimestamp - 2000) return;
 
-        const isStream =
-          msg.streaming === true ||
-          (typeof msg.chunkCount === "number" && msg.chunkCount > 0 && !msg.audioBase64);
-
-        if (isStream) {
-          if (change.type === "added" || change.type === "modified") {
+        if (!msg.audioBase64 || !msg.size) {
+          if (msg.streaming === true || msg.chunkCount > 0) {
             handleStreamingMessage(id, msg);
           }
           return;
         }
 
-        if (change.type !== "added") return;
-        if (!msg.audioBase64) return;
         if (playedMessageIds.has(id)) return;
-
         playedMessageIds.add(id);
         enqueuePlayback(msg);
         vibrate(40);
@@ -1944,10 +2027,12 @@ function setupListeners() {
         if (currentTab !== "chat") {
           unreadChatCount += 1;
           updateChatBadge();
-          if (currentTab === "radio") {
-            showToast(`${msg.senderName || "Someone"}: ${(msg.text || "").slice(0, 40)}`, "info");
-          }
         }
+        notifyIncomingChat(msg);
+        if (currentTab === "radio") {
+          showToast(`${msg.senderName || "Someone"}: ${(msg.text || "").slice(0, 40)}`, "info");
+        }
+        vibrate(30);
       });
     });
 
@@ -2001,6 +2086,7 @@ async function leaveChannel() {
   setPttState("idle");
   setFooterMode("");
   switchTab("radio");
+  localStorage.removeItem(STORAGE_KEY_AUTO_JOIN);
   showScreen("join");
   setConnectionState("", "Connecting…");
 }
@@ -2087,6 +2173,44 @@ document.body.addEventListener("touchmove", (e) => {
   if (isTransmitting) e.preventDefault();
 }, { passive: false });
 
+let autoRejoinStarted = false;
+
+function shouldAutoRejoinChannel() {
+  if (localStorage.getItem(STORAGE_KEY_AUTO_JOIN) === "1") return true;
+  const name = localStorage.getItem(STORAGE_KEY_NAME);
+  const channel = localStorage.getItem(STORAGE_KEY_CHANNEL);
+  if (name && channel) {
+    localStorage.setItem(STORAGE_KEY_AUTO_JOIN, "1");
+    return true;
+  }
+  return false;
+}
+
+async function tryAutoRejoinChannel() {
+  if (autoRejoinStarted || channelDocRef) return;
+  if (!shouldAutoRejoinChannel()) return;
+
+  const name = (localStorage.getItem(STORAGE_KEY_NAME) || displayNameInput?.value || "").trim();
+  const channel = (
+    localStorage.getItem(STORAGE_KEY_CHANNEL) ||
+    channelIdInput?.value ||
+    ""
+  ).trim();
+  if (!name || !channel) return;
+
+  autoRejoinStarted = true;
+  if (displayNameInput) displayNameInput.value = name;
+  if (channelIdInput) channelIdInput.value = channel;
+  updateChannelPreview();
+
+  try {
+    await joinChannel(name, channel);
+  } catch (err) {
+    console.warn("Auto-rejoin failed:", err);
+    autoRejoinStarted = false;
+  }
+}
+
 async function initAuth() {
   try {
     await auth.setPersistence(firebase.auth.Auth.Persistence.LOCAL);
@@ -2102,6 +2226,7 @@ async function initAuth() {
     if (user) {
       uid = user.uid;
       setJoinReady(true);
+      tryAutoRejoinChannel();
     } else {
       uid = null;
       setJoinReady(false);

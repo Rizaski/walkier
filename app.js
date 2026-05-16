@@ -916,16 +916,38 @@ async function resumeAudioSession() {
 }
 
 async function prepareMobileChannelAudio() {
-  playback.setAttribute("playsinline", "");
-  playback.setAttribute("webkit-playsinline", "");
+  if (playback) {
+    playback.setAttribute("playsinline", "");
+    playback.setAttribute("webkit-playsinline", "");
+  }
   await registerServiceWorker();
-  await ensureNotificationPermission();
+  if (Notification.permission === "granted") {
+    notificationsReady = true;
+  }
   await startKeepAliveAudio();
   await resumeAudioSession();
   if ("mediaSession" in navigator) {
-    navigator.mediaSession.setActionHandler("play", () => resumeAudioSession());
-    navigator.mediaSession.setActionHandler("pause", () => {});
+    try {
+      navigator.mediaSession.setActionHandler("play", () => resumeAudioSession());
+      navigator.mediaSession.setActionHandler("pause", () => {});
+    } catch (err) {
+      console.warn("Media session handlers failed:", err);
+    }
   }
+}
+
+/** Non-blocking; must not fail channel join. */
+function prepareMobileChannelAudioSafe() {
+  prepareMobileChannelAudio().catch((err) => {
+    console.warn("Mobile audio prep failed:", err);
+  });
+}
+
+function promptNotificationsAfterJoin() {
+  if (!("Notification" in window) || Notification.permission !== "default") return;
+  ensureNotificationPermission().then((granted) => {
+    if (granted) showToast("Notifications on for background voice alerts", "success");
+  });
 }
 
 document.addEventListener("visibilitychange", () => {
@@ -1046,12 +1068,6 @@ async function joinChannel(name, channel) {
 
     joinTimestamp = Date.now();
     setupListeners();
-    await prepareMobileChannelAudio();
-    if (notificationsReady) {
-      showToast("Notifications on for background voice alerts", "success");
-    } else if ("Notification" in window && Notification.permission !== "denied") {
-      showToast("Allow notifications when prompted for alerts while away", "info");
-    }
     await initMicrophone();
 
     saveRecentChannel(channelId);
@@ -1066,6 +1082,8 @@ async function joinChannel(name, channel) {
     updateChatBadge();
     showScreen("main");
     showToast(`Joined #${channelId}`, "success");
+    prepareMobileChannelAudioSafe();
+    promptNotificationsAfterJoin();
   } catch (err) {
     console.error("Join channel error:", err);
     showError(joinError, firebaseErrorMessage(err));
